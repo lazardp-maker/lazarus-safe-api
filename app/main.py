@@ -1,18 +1,40 @@
-from scripts.init_db import initialize_database
-from typing import Optional
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+
+from scripts.init_db import initialize_database
+import scripts.seed_sources as seed_sources_script
+import scripts.seed_area_profiles as seed_area_profiles_script
+
 from app.schemas import AnalyzeRequest, AnalyzeResponse
 from app.risk_engine import evaluate_risk, get_sources_used
 
-initialize_database()
+import requests
+from typing import Optional
 
 app = FastAPI(
     title="Lazarus Safe API",
     version="2.0.0",
-    description="API pentru evaluarea riscului de securitate fizică pe baza locației."
 )
+
+# 🔥 AICI ESTE CHEIA
+@app.on_event("startup")
+def startup_event():
+    print("🚀 Initializing database...")
+
+    initialize_database()
+
+    try:
+        seed_sources_script.main()
+        print("✅ sources seeded")
+    except Exception as e:
+        print(f"seed_sources error: {e}")
+
+    try:
+        seed_area_profiles_script.main()
+        print("✅ area profiles seeded")
+    except Exception as e:
+        print(f"seed_area_profiles error: {e}")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,6 +43,27 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+def home():
+    return {"status": "ok"}
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+def analyze(payload: AnalyzeRequest):
+    county = "bucuresti"
+    city = "bucuresti"
+
+    result = evaluate_risk(county, city)
+    sources_used = get_sources_used(county)
+
+    return AnalyzeResponse(
+        level=result["level"],
+        message=result["message"],
+        county=county,
+        city=city,
+        incidents_summary=result["incidents_summary"],
+        sources_used=sources_used,
+    )
 
 
 def reverse_geocode_mock(lat: float, lng: float) -> tuple[Optional[str], Optional[str]]:
