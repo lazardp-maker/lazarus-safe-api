@@ -258,24 +258,15 @@ def validate_critical_tables(conn: sqlite3.Connection) -> None:
     }
 
     cursor = conn.cursor()
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS area_risk_profiles (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    county TEXT,
-    city TEXT,
-    locality_type TEXT,
-    crime_coefficient REAL,
-    violence_coefficient REAL,
-    theft_coefficient REAL,
-    traffic_coefficient REAL,
-    emergency_coefficient REAL,
-    source_note TEXT
-);
-""")
+    cursor.execute("""
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+    """)
 
     existing_tables = {row["name"] for row in cursor.fetchall()}
-
     missing_tables = sorted(required_tables - existing_tables)
+
     if missing_tables:
         raise RuntimeError(f"Lipsesc tabele critice după init: {missing_tables}")
 
@@ -288,9 +279,11 @@ def initialize_database() -> None:
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA temp_store = MEMORY;")
+
         conn.executescript(SCHEMA_SQL)
         conn.executescript(TRIGGERS_SQL)
         conn.commit()
+
         validate_critical_tables(conn)
         print(f"Database initialized: {DB_PATH}")
     finally:
@@ -301,7 +294,6 @@ def print_summary() -> None:
     conn = get_connection()
     try:
         cursor = conn.cursor()
-
         cursor.execute("""
             SELECT name
             FROM sqlite_master
