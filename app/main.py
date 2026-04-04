@@ -1,13 +1,10 @@
+from scripts.init_db import initialize_database
 from typing import Optional
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-
-from scripts.init_db import initialize_database
 from app.schemas import AnalyzeRequest, AnalyzeResponse
 from app.risk_engine import evaluate_risk, get_sources_used
-
 
 initialize_database()
 

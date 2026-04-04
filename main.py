@@ -1,14 +1,18 @@
+from scripts.init_db import initialize_database
 from typing import Optional
-
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-
 from app.schemas import AnalyzeRequest, AnalyzeResponse
 from app.risk_engine import evaluate_risk, get_sources_used
 
+initialize_database()
 
-app = FastAPI(title="Lazarus Safe API v2")
+app = FastAPI(
+    title="Lazarus Safe API",
+    version="2.0.0",
+    description="API pentru evaluarea riscului de securitate fizică pe baza locației."
+)
 
 
 app.add_middleware(
