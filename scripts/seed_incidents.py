@@ -1,16 +1,14 @@
 import sqlite3
 import hashlib
-from pathlib import Path
 from datetime import datetime, timedelta
 
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "data" / "lazarus_safe.db"
+from scripts.init_db import DB_PATH
 
 
 def normalize_text(value: str | None) -> str | None:
     if value is None:
         return None
+
     value = value.strip().lower()
     replacements = {
         "ă": "a",
@@ -21,8 +19,10 @@ def normalize_text(value: str | None) -> str | None:
         "ț": "t",
         "ţ": "t",
     }
+
     for old, new in replacements.items():
         value = value.replace(old, new)
+
     value = " ".join(value.split())
     return value
 
@@ -303,55 +303,52 @@ def build_seed_rows():
             item["source_priority"],
             None,
         ))
+
     return rows
 
 
-def main():
+def main() -> None:
     rows = build_seed_rows()
 
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    cursor.execute("PRAGMA journal_mode=WAL;")
-    cursor.execute("PRAGMA synchronous=NORMAL;")
+        cursor.executemany("""
+            INSERT OR IGNORE INTO incidents (
+                incident_uid,
+                incident_type,
+                severity_level,
+                title,
+                summary,
+                event_date,
+                published_date,
+                address_text,
+                location_text,
+                city,
+                county,
+                latitude,
+                longitude,
+                geo_confidence,
+                ai_confidence,
+                is_verified,
+                verification_status,
+                source_priority,
+                duplicate_group_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
 
-    cursor.executemany("""
-        INSERT OR IGNORE INTO incidents (
-            incident_uid,
-            incident_type,
-            severity_level,
-            title,
-            summary,
-            event_date,
-            published_date,
-            address_text,
-            location_text,
-            city,
-            county,
-            latitude,
-            longitude,
-            geo_confidence,
-            ai_confidence,
-            is_verified,
-            verification_status,
-            source_priority,
-            duplicate_group_id
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, rows)
+        conn.commit()
 
-    inserted = cursor.rowcount
-    conn.commit()
+        cursor.execute("SELECT COUNT(*) FROM incidents")
+        total = cursor.fetchone()[0]
 
-    cursor.execute("SELECT COUNT(*) FROM incidents")
-    total = cursor.fetchone()[0]
-
-    conn.close()
-
-    print(f"Seed incidents finalizat. Inserate acum: {inserted}")
-    print(f"Total incidente in baza: {total}")
-    print(f"DB: {DB_PATH}")
+        print(f"incidents seeded")
+        print(f"total incidents in db: {total}")
+        print(f"db path: {DB_PATH}")
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

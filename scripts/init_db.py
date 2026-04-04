@@ -3,7 +3,8 @@ from pathlib import Path
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR /"data"/ "lazarus_safe.db"
+DATA_DIR = BASE_DIR / "data"
+DB_PATH = DATA_DIR / "lazarus_safe.db"
 
 
 SCHEMA_SQL = """
@@ -246,33 +247,15 @@ def get_connection() -> sqlite3.Connection:
     return conn
 
 
-def initialize_database() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    conn = get_connection()
-    try:
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA synchronous = NORMAL;")
-        conn.execute("PRAGMA temp_store = MEMORY;")
-        conn.executescript(SCHEMA_SQL)
-        conn.executescript(TRIGGERS_SQL)
-        conn.commit()
-
-        validate_critical_tables(conn)
-
-    finally:
-        conn.close()
-
-
 def validate_critical_tables(conn: sqlite3.Connection) -> None:
-    required_tables = [
+    required_tables = {
         "sources",
         "articles",
         "incidents",
         "incident_mentions",
         "area_risk_profiles",
         "analysis_runs",
-    ]
+    }
 
     cursor = conn.cursor()
     cursor.execute("""
@@ -282,9 +265,26 @@ def validate_critical_tables(conn: sqlite3.Connection) -> None:
     """)
     existing_tables = {row["name"] for row in cursor.fetchall()}
 
-    missing_tables = [table for table in required_tables if table not in existing_tables]
+    missing_tables = sorted(required_tables - existing_tables)
     if missing_tables:
         raise RuntimeError(f"Lipsesc tabele critice după init: {missing_tables}")
+
+
+def initialize_database() -> None:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    conn = get_connection()
+    try:
+        conn.execute("PRAGMA journal_mode = WAL;")
+        conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA temp_store = MEMORY;")
+        conn.executescript(SCHEMA_SQL)
+        conn.executescript(TRIGGERS_SQL)
+        conn.commit()
+        validate_critical_tables(conn)
+        print(f"Database initialized: {DB_PATH}")
+    finally:
+        conn.close()
 
 
 def print_summary() -> None:
@@ -307,10 +307,8 @@ def print_summary() -> None:
         print(f"Database initialized successfully: {DB_PATH}")
         print(f"Journal mode: {journal_mode}")
         print("Tables:")
-
         for table in tables:
             print(f" - {table}")
-
     finally:
         conn.close()
 

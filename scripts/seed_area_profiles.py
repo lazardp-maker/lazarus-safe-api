@@ -1,199 +1,205 @@
 import sqlite3
-from pathlib import Path
+from scripts.init_db import DB_PATH
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "lazarus_safe_v2.db"
 
-SOURCES = [
-    # ===== SURSE OFICIALE NATIONALE =====
+AREA_RISK_PROFILES = [
+    # ===== PROFILURI JUDEȚENE =====
     {
-        "name": "Politia Romana",
-        "source_type": "official",
-        "base_url": "https://www.politiaromana.ro",
-        "county": None,
-        "city": None,
-        "trust_level": 5,
-        "is_active": 1,
-    },
-    {
-        "name": "DSU",
-        "source_type": "official",
-        "base_url": "https://www.dsu.mai.gov.ro",
-        "county": None,
-        "city": None,
-        "trust_level": 5,
-        "is_active": 1,
-    },
-    {
-        "name": "IGSU",
-        "source_type": "official",
-        "base_url": "https://www.igsu.ro",
-        "county": None,
-        "city": None,
-        "trust_level": 5,
-        "is_active": 1,
-    },
-
-    # ===== SURSE OFICIALE LOCALE - ARGES =====
-    {
-        "name": "IPJ Arges",
-        "source_type": "official",
-        "base_url": "https://ag.politiaromana.ro",
         "county": "arges",
-        "city": None,
-        "trust_level": 5,
-        "is_active": 1,
+        "city": "",
+        "locality_type": "county",
+        "crime_coefficient": 1.20,
+        "violence_coefficient": 1.10,
+        "theft_coefficient": 1.15,
+        "traffic_coefficient": 1.00,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil județean Argeș",
     },
     {
-        "name": "ISU Arges",
-        "source_type": "official",
-        "base_url": "https://www.isuarges.ro",
-        "county": "arges",
-        "city": None,
-        "trust_level": 5,
-        "is_active": 1,
+        "county": "bucuresti",
+        "city": "",
+        "locality_type": "county",
+        "crime_coefficient": 1.40,
+        "violence_coefficient": 1.25,
+        "theft_coefficient": 1.35,
+        "traffic_coefficient": 1.10,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil județean București",
     },
     {
-        "name": "Politia Locala Pitesti",
-        "source_type": "official",
-        "base_url": "https://www.primariapitesti.ro",
+        "county": "cluj",
+        "city": "",
+        "locality_type": "county",
+        "crime_coefficient": 1.15,
+        "violence_coefficient": 1.05,
+        "theft_coefficient": 1.10,
+        "traffic_coefficient": 1.00,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil județean Cluj",
+    },
+    {
+        "county": "timis",
+        "city": "",
+        "locality_type": "county",
+        "crime_coefficient": 1.18,
+        "violence_coefficient": 1.08,
+        "theft_coefficient": 1.12,
+        "traffic_coefficient": 1.02,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil județean Timiș",
+    },
+    {
+        "county": "iasi",
+        "city": "",
+        "locality_type": "county",
+        "crime_coefficient": 1.16,
+        "violence_coefficient": 1.07,
+        "theft_coefficient": 1.11,
+        "traffic_coefficient": 1.01,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil județean Iași",
+    },
+    {
+        "county": "constanta",
+        "city": "",
+        "locality_type": "county",
+        "crime_coefficient": 1.22,
+        "violence_coefficient": 1.10,
+        "theft_coefficient": 1.18,
+        "traffic_coefficient": 1.05,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil județean Constanța",
+    },
+
+    # ===== PROFILURI ORAȘE =====
+    {
         "county": "arges",
         "city": "pitesti",
-        "trust_level": 4,
-        "is_active": 1,
+        "locality_type": "city",
+        "crime_coefficient": 1.35,
+        "violence_coefficient": 1.20,
+        "theft_coefficient": 1.30,
+        "traffic_coefficient": 1.05,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil oraș Pitești",
     },
-
-    # ===== PRESA LOCALA / REGIONALA - ARGES =====
     {
-        "name": "Ziarul Argesul",
-        "source_type": "press",
-        "base_url": "https://ziarulargesul.ro",
         "county": "arges",
-        "city": None,
-        "trust_level": 4,
-        "is_active": 1,
+        "city": "mioveni",
+        "locality_type": "city",
+        "crime_coefficient": 1.10,
+        "violence_coefficient": 1.05,
+        "theft_coefficient": 1.00,
+        "traffic_coefficient": 1.00,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil oraș Mioveni",
     },
     {
-        "name": "Ancheta Online",
-        "source_type": "press",
-        "base_url": "https://anchetaonline.ro",
-        "county": "arges",
-        "city": None,
-        "trust_level": 4,
-        "is_active": 1,
+        "county": "bucuresti",
+        "city": "bucuresti",
+        "locality_type": "city",
+        "crime_coefficient": 1.45,
+        "violence_coefficient": 1.30,
+        "theft_coefficient": 1.40,
+        "traffic_coefficient": 1.10,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil municipiu București",
     },
     {
-        "name": "Jurnalul de Arges",
-        "source_type": "press",
-        "base_url": "https://jurnaluldearges.ro",
-        "county": "arges",
-        "city": None,
-        "trust_level": 4,
-        "is_active": 1,
+        "county": "cluj",
+        "city": "cluj-napoca",
+        "locality_type": "city",
+        "crime_coefficient": 1.20,
+        "violence_coefficient": 1.10,
+        "theft_coefficient": 1.15,
+        "traffic_coefficient": 1.03,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil oraș Cluj-Napoca",
     },
     {
-        "name": "ePitesti",
-        "source_type": "press",
-        "base_url": "https://epitesti.ro",
-        "county": "arges",
-        "city": "pitesti",
-        "trust_level": 4,
-        "is_active": 1,
-    },
-
-    # ===== PRESA NATIONALA - BACKUP / COROBORARE =====
-    {
-        "name": "Agerpres",
-        "source_type": "press",
-        "base_url": "https://agerpres.ro",
-        "county": None,
-        "city": None,
-        "trust_level": 5,
-        "is_active": 1,
+        "county": "timis",
+        "city": "timisoara",
+        "locality_type": "city",
+        "crime_coefficient": 1.22,
+        "violence_coefficient": 1.12,
+        "theft_coefficient": 1.16,
+        "traffic_coefficient": 1.04,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil oraș Timișoara",
     },
     {
-        "name": "Digi24",
-        "source_type": "press",
-        "base_url": "https://www.digi24.ro",
-        "county": None,
-        "city": None,
-        "trust_level": 3,
-        "is_active": 1,
+        "county": "iasi",
+        "city": "iasi",
+        "locality_type": "city",
+        "crime_coefficient": 1.19,
+        "violence_coefficient": 1.10,
+        "theft_coefficient": 1.14,
+        "traffic_coefficient": 1.03,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil oraș Iași",
     },
     {
-        "name": "Stirile ProTV",
-        "source_type": "press",
-        "base_url": "https://stirileprotv.ro",
-        "county": None,
-        "city": None,
-        "trust_level": 3,
-        "is_active": 1,
+        "county": "constanta",
+        "city": "constanta",
+        "locality_type": "city",
+        "crime_coefficient": 1.24,
+        "violence_coefficient": 1.12,
+        "theft_coefficient": 1.18,
+        "traffic_coefficient": 1.05,
+        "emergency_coefficient": 1.00,
+        "source_note": "Profil oraș Constanța",
     },
 ]
 
+
 INSERT_SQL = """
-INSERT INTO sources (
-    name,
-    source_type,
-    base_url,
+INSERT OR IGNORE INTO area_risk_profiles (
     county,
     city,
-    trust_level,
-    is_active
+    locality_type,
+    crime_coefficient,
+    violence_coefficient,
+    theft_coefficient,
+    traffic_coefficient,
+    emergency_coefficient,
+    source_note
 )
-SELECT ?, ?, ?, ?, ?, ?, ?
-WHERE NOT EXISTS (
-    SELECT 1
-    FROM sources
-    WHERE lower(name) = lower(?)
-      AND COALESCE(lower(county), '') = COALESCE(lower(?), '')
-      AND COALESCE(lower(city), '') = COALESCE(lower(?), '')
-);
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 """
 
-def main():
+
+def main() -> None:
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    inserted = 0
-
-    for source in SOURCES:
-        cursor.execute(
-            INSERT_SQL,
+        rows = [
             (
-                source["name"],
-                source["source_type"],
-                source["base_url"],
-                source["county"],
-                source["city"],
-                source["trust_level"],
-                source["is_active"],
-                source["name"],
-                source["county"],
-                source["city"],
+                item["county"],
+                item["city"],
+                item["locality_type"],
+                item["crime_coefficient"],
+                item["violence_coefficient"],
+                item["theft_coefficient"],
+                item["traffic_coefficient"],
+                item["emergency_coefficient"],
+                item["source_note"],
             )
-        )
+            for item in AREA_RISK_PROFILES
+        ]
 
-        if cursor.rowcount > 0:
-            inserted += 1
+        cursor.executemany(INSERT_SQL, rows)
+        conn.commit()
 
-    conn.commit()
+        cursor.execute("SELECT COUNT(*) FROM area_risk_profiles")
+        total = cursor.fetchone()[0]
 
-    cursor.execute("""
-        SELECT
-            id, name, source_type, base_url, county, city, trust_level, is_active
-        FROM sources
-        ORDER BY trust_level DESC, source_type ASC, name ASC
-    """)
-    rows = cursor.fetchall()
+        print("area_risk_profiles seeded")
+        print(f"total area profiles in db: {total}")
+        print(f"db path: {DB_PATH}")
+    finally:
+        conn.close()
 
-    conn.close()
-
-    print(f"Sources seed complete. Newly inserted: {inserted}")
-    print("Current active source inventory:")
-    for row in rows:
-        print(row)
 
 if __name__ == "__main__":
     main()
-

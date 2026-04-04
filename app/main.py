@@ -1,3 +1,6 @@
+from typing import Optional
+
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -9,19 +12,17 @@ import scripts.seed_area_profiles as seed_area_profiles_script
 from app.schemas import AnalyzeRequest, AnalyzeResponse
 from app.risk_engine import evaluate_risk, get_sources_used
 
-import requests
-from typing import Optional
 
 app = FastAPI(
     title="Lazarus Safe API",
     version="2.0.0",
+    description="API pentru evaluarea riscului de securitate fizică pe baza locației."
 )
 
-# 🔥 AICI ESTE CHEIA
-@app.on_event("startup")
-def startup_event():
-    print("🚀 Initializing database...")
 
+@app.on_event("startup")
+def startup_event() -> None:
+    print("🚀 Initializing database...")
     initialize_database()
 
     try:
@@ -36,6 +37,7 @@ def startup_event():
     except Exception as e:
         print(f"seed_area_profiles error: {e}")
 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,44 +46,93 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/")
-def home():
-    return {"status": "ok"}
 
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(payload: AnalyzeRequest):
-    county = "bucuresti"
-    city = "bucuresti"
+def normalize_text(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
 
-    result = evaluate_risk(county, city)
-    sources_used = get_sources_used(county)
+    value = value.strip().lower()
+    replacements = {
+        "ă": "a",
+        "â": "a",
+        "î": "i",
+        "ș": "s",
+        "ş": "s",
+        "ț": "t",
+        "ţ": "t",
+    }
 
-    return AnalyzeResponse(
-        level=result["level"],
-        message=result["message"],
-        county=county,
-        city=city,
-        incidents_summary=result["incidents_summary"],
-        sources_used=sources_used,
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+
+    value = " ".join(value.split())
+    return value
+
+
+def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optional[str]]:
+    url = "https://nominatim.openstreetmap.org/reverse"
+
+    headers = {
+        "User-Agent": "LazarusSafe/1.0 (contact: lazardp@gmail.com)",
+        "Accept-Language": "ro",
+    }
+
+    params = {
+        "lat": lat,
+        "lon": lng,
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "zoom": 12,
+    }
+
+    try:
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+    except requests.RequestException as e:
+        print(f"reverse geocoding error: {e}")
+        return None, None
+
+    address = data.get("address", {})
+
+    county = (
+        address.get("county")
+        or address.get("state_district")
+        or address.get("state")
     )
 
+    city = (
+        address.get("city")
+        or address.get("town")
+        or address.get("municipality")
+        or address.get("village")
+        or address.get("suburb")
+    )
 
-def reverse_geocode_mock(lat: float, lng: float) -> tuple[Optional[str], Optional[str]]:
-    """
-    Variantă temporară pentru MVP.
-    Se va înlocui ulterior cu geocodare reală.
-    """
-    if 44.7 <= lat <= 45.0 and 24.7 <= lng <= 25.1:
-        return "arges", "pitesti"
+    county_n = normalize_text(county)
+    city_n = normalize_text(city)
 
-    if 44.3 <= lat <= 44.6 and 25.9 <= lng <= 26.3:
-        return "bucuresti", "bucuresti"
+    if county_n == "municipiul bucuresti":
+        county_n = "bucuresti"
+    if city_n == "municipiul bucuresti":
+        city_n = "bucuresti"
 
-    return None, None
+    return county_n, city_n
 
 
 def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
-    county, city = reverse_geocode_mock(payload.lat, payload.lng)
+    county, city = reverse_geocode_real(payload.lat, payload.lng)
+
+    if not county:
+        return AnalyzeResponse(
+            level="UNKNOWN",
+            message="Nu am putut identifica județul sau localitatea pentru coordonatele primite.",
+            county=None,
+            city=None,
+            incidents_summary={},
+            sources_used=[],
+        )
+
     result = evaluate_risk(county, city)
     sources_used = get_sources_used(county)
 
@@ -148,7 +199,7 @@ def home() -> str:
 def health() -> dict:
     return {
         "status": "ok",
-        "service": "Lazarus Safe API"
+        "service": "Lazarus Safe API",
     }
 
 
