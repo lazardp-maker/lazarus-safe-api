@@ -3,16 +3,15 @@ import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta
 
+
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "lazarus_safe_v2.db"
+DB_PATH = BASE_DIR / "data" / "lazarus_safe.db"
 
 
 def normalize_text(value: str | None) -> str | None:
     if value is None:
         return None
-
     value = value.strip().lower()
-
     replacements = {
         "ă": "a",
         "â": "a",
@@ -22,10 +21,8 @@ def normalize_text(value: str | None) -> str | None:
         "ț": "t",
         "ţ": "t",
     }
-
     for old, new in replacements.items():
         value = value.replace(old, new)
-
     value = " ".join(value.split())
     return value
 
@@ -53,8 +50,6 @@ def iso_days_ago(days_ago: int) -> str:
 
 
 def build_seed_rows():
-    # Date de test realiste pentru MVP.
-    # Le poți înlocui ulterior cu date colectate automat.
     raw_incidents = [
         {
             "incident_type": "theft",
@@ -134,7 +129,7 @@ def build_seed_rows():
             "title": "Tulburarea ordinii publice in proximitatea unui local",
             "summary": "Au fost semnalate zgomote si comportament agresiv in timpul noptii.",
             "days_ago": 7,
-            "address_text": "Zona Exercițiu",
+            "address_text": "Zona Exercitiu",
             "location_text": "Pitesti, Arges",
             "city": "pitesti",
             "county": "arges",
@@ -143,7 +138,7 @@ def build_seed_rows():
             "geo_confidence": 0.80,
             "ai_confidence": 0.84,
             "is_verified": 0,
-            "verification_status": "pending",
+            "verification_status": "unverified",
             "source_priority": 3,
         },
         {
@@ -251,7 +246,7 @@ def build_seed_rows():
             "geo_confidence": 0.85,
             "ai_confidence": 0.86,
             "is_verified": 0,
-            "verification_status": "pending",
+            "verification_status": "unverified",
             "source_priority": 3,
         },
         {
@@ -269,16 +264,16 @@ def build_seed_rows():
             "geo_confidence": 0.75,
             "ai_confidence": 0.78,
             "is_verified": 0,
-            "verification_status": "pending",
+            "verification_status": "unverified",
             "source_priority": 3,
         },
     ]
 
     rows = []
-
     for item in raw_incidents:
         event_date = iso_days_ago(item["days_ago"])
         published_date = event_date
+
         incident_uid = build_incident_uid(
             incident_type=item["incident_type"],
             county=item["county"],
@@ -295,7 +290,6 @@ def build_seed_rows():
             item["summary"].strip(),
             event_date,
             published_date,
-            item["days_ago"],
             item["address_text"],
             item["location_text"],
             normalize_text(item["city"]) if item["city"] else None,
@@ -309,13 +303,13 @@ def build_seed_rows():
             item["source_priority"],
             None,
         ))
-
     return rows
 
 
 def main():
     rows = build_seed_rows()
 
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
@@ -331,7 +325,6 @@ def main():
             summary,
             event_date,
             published_date,
-            days_ago,
             address_text,
             location_text,
             city,
@@ -345,7 +338,7 @@ def main():
             source_priority,
             duplicate_group_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, rows)
 
     inserted = cursor.rowcount
