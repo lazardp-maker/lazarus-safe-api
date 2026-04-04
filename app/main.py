@@ -74,7 +74,8 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
 
     headers = {
         "User-Agent": "LazarusSafe/1.0 (contact: lazardp@gmail.com)",
-        "Accept-Language": "ro",
+        "Accept": "application/json",
+        "Accept-Language": "ro,en",
     }
 
     params = {
@@ -82,42 +83,65 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
         "lon": lng,
         "format": "jsonv2",
         "addressdetails": 1,
-        "zoom": 12,
+        "zoom": 14,
     }
 
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response = requests.get(url, params=params, headers=headers, timeout=15)
+        print(f"[geocode] status_code={response.status_code}")
+        print(f"[geocode] raw_response={response.text[:1000]}")
         response.raise_for_status()
+
         data = response.json()
-    except requests.RequestException as e:
-        print(f"reverse geocoding error: {e}")
+        address = data.get("address", {})
+
+        county = (
+            address.get("county")
+            or address.get("state_district")
+            or address.get("state")
+        )
+
+        city = (
+            address.get("city")
+            or address.get("town")
+            or address.get("municipality")
+            or address.get("village")
+            or address.get("hamlet")
+            or address.get("suburb")
+            or address.get("city_district")
+        )
+
+        county_n = normalize_text(county)
+        city_n = normalize_text(city)
+
+        if county_n in {"municipiul bucuresti", "bucharest"}:
+            county_n = "bucuresti"
+
+        if city_n in {"municipiul bucuresti", "bucharest"}:
+            city_n = "bucuresti"
+
+        print(f"[geocode] county={county} -> {county_n}")
+        print(f"[geocode] city={city} -> {city_n}")
+
+        return county_n, city_n
+
+    except Exception as e:
+        print(f"[geocode] error={e}")
         return None, None
 
-    address = data.get("address", {})
 
-    county = (
-        address.get("county")
-        or address.get("state_district")
-        or address.get("state")
-    )
-
-    city = (
-        address.get("city")
-        or address.get("town")
-        or address.get("municipality")
-        or address.get("village")
-        or address.get("suburb")
-    )
-
-    county_n = normalize_text(county)
-    city_n = normalize_text(city)
-
-    if county_n == "municipiul bucuresti":
-        county_n = "bucuresti"
-    if city_n == "municipiul bucuresti":
-        city_n = "bucuresti"
-
-    return county_n, city_n
+def empty_incidents_summary() -> dict:
+    return {
+        "homicide": 0,
+        "sexual_violence": 0,
+        "robbery": 0,
+        "theft": 0,
+        "violence": 0,
+        "traffic": 0,
+        "emergency": 0,
+        "public_order": 0,
+        "general": 0,
+    }
 
 
 def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
@@ -129,7 +153,7 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
             message="Nu am putut identifica județul sau localitatea pentru coordonatele primite.",
             county=None,
             city=None,
-            incidents_summary={},
+            incidents_summary=empty_incidents_summary(),
             sources_used=[],
         )
 
