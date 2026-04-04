@@ -258,11 +258,21 @@ def validate_critical_tables(conn: sqlite3.Connection) -> None:
     }
 
     cursor = conn.cursor()
-    cursor.execute("""
-        SELECT name
-        FROM sqlite_master
-        WHERE type = 'table'
-    """)
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS area_risk_profiles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    county TEXT,
+    city TEXT,
+    locality_type TEXT,
+    crime_coefficient REAL,
+    violence_coefficient REAL,
+    theft_coefficient REAL,
+    traffic_coefficient REAL,
+    emergency_coefficient REAL,
+    source_note TEXT
+);
+""")
+
     existing_tables = {row["name"] for row in cursor.fetchall()}
 
     missing_tables = sorted(required_tables - existing_tables)
