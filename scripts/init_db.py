@@ -1,8 +1,10 @@
 import sqlite3
 from pathlib import Path
 
+
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "lazarus_safe.db"
+DB_PATH = BASE_DIR /"data"/ "lazarus_safe.db"
+
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -192,6 +194,7 @@ CREATE INDEX IF NOT EXISTS idx_analysis_runs_created_at
 ON analysis_runs(created_at);
 """
 
+
 TRIGGERS_SQL = """
 CREATE TRIGGER IF NOT EXISTS trg_sources_updated_at
 AFTER UPDATE ON sources
@@ -235,43 +238,79 @@ END;
 """
 
 
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA busy_timeout = 5000;")
+    return conn
+
+
 def initialize_database() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     try:
-        conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
         conn.execute("PRAGMA temp_store = MEMORY;")
-
         conn.executescript(SCHEMA_SQL)
         conn.executescript(TRIGGERS_SQL)
         conn.commit()
+
+        validate_critical_tables(conn)
+
     finally:
         conn.close()
 
 
+def validate_critical_tables(conn: sqlite3.Connection) -> None:
+    required_tables = [
+        "sources",
+        "articles",
+        "incidents",
+        "incident_mentions",
+        "area_risk_profiles",
+        "analysis_runs",
+    ]
+
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+    """)
+    existing_tables = {row["name"] for row in cursor.fetchall()}
+
+    missing_tables = [table for table in required_tables if table not in existing_tables]
+    if missing_tables:
+        raise RuntimeError(f"Lipsesc tabele critice după init: {missing_tables}")
+
+
 def print_summary() -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     try:
         cursor = conn.cursor()
+
         cursor.execute("""
             SELECT name
             FROM sqlite_master
             WHERE type = 'table'
             ORDER BY name
         """)
-        tables = [row[0] for row in cursor.fetchall()]
+        tables = [row["name"] for row in cursor.fetchall()]
 
         cursor.execute("PRAGMA journal_mode;")
-        journal_mode = cursor.fetchone()[0]
+        journal_mode_row = cursor.fetchone()
+        journal_mode = journal_mode_row[0] if journal_mode_row else "unknown"
 
         print(f"Database initialized successfully: {DB_PATH}")
         print(f"Journal mode: {journal_mode}")
         print("Tables:")
+
         for table in tables:
             print(f" - {table}")
+
     finally:
         conn.close()
 
