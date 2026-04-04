@@ -4,16 +4,18 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
+from scripts.init_db import initialize_database
 from app.schemas import AnalyzeRequest, AnalyzeResponse
 from app.risk_engine import evaluate_risk, get_sources_used
 
 
+initialize_database()
+
 app = FastAPI(
-    title="Lazarus Safe API v2",
+    title="Lazarus Safe API",
     version="2.0.0",
     description="API pentru evaluarea riscului de securitate fizică pe baza locației."
 )
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,11 +31,9 @@ def reverse_geocode_mock(lat: float, lng: float) -> tuple[Optional[str], Optiona
     Variantă temporară pentru MVP.
     Se va înlocui ulterior cu geocodare reală.
     """
-    # Pitești / Argeș - zonă de test
     if 44.7 <= lat <= 45.0 and 24.7 <= lng <= 25.1:
         return "arges", "pitesti"
 
-    # București - zonă de test
     if 44.3 <= lat <= 44.6 and 25.9 <= lng <= 26.3:
         return "bucuresti", "bucuresti"
 
@@ -42,7 +42,6 @@ def reverse_geocode_mock(lat: float, lng: float) -> tuple[Optional[str], Optiona
 
 def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
     county, city = reverse_geocode_mock(payload.lat, payload.lng)
-
     result = evaluate_risk(county, city)
     sources_used = get_sources_used(county)
 
@@ -61,7 +60,7 @@ def home() -> str:
     return """
     <html>
         <head>
-            <title>Lazarus Safe API v2</title>
+            <title>Lazarus Safe API</title>
             <style>
                 body {
                     font-family: Arial, sans-serif;
@@ -91,7 +90,7 @@ def home() -> str:
         </head>
         <body>
             <div class="box">
-                <h1>Lazarus Safe API v2</h1>
+                <h1>Lazarus Safe API</h1>
                 <p>Evaluator de risc la securitate fizică - Lazar Vasile</p>
                 <p><strong>Endpoint principal:</strong></p>
                 <p><code>POST /analyze</code></p>
@@ -109,7 +108,7 @@ def home() -> str:
 def health() -> dict:
     return {
         "status": "ok",
-        "service": "Lazarus Safe API v2"
+        "service": "Lazarus Safe API"
     }
 
 
