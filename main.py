@@ -7,6 +7,12 @@ from app.schemas import AnalyzeRequest, AnalyzeResponse
 from app.risk_engine import evaluate_risk, get_sources_used
 
 initialize_database()
+from scripts.seed_area_profiles import seed_area_profiles
+from scripts.seed_sources import seed_sources
+
+seed_area_profiles()
+seed_sources()
+
 
 app = FastAPI(
     title="Lazarus Safe API",
