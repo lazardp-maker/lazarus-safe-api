@@ -1,8 +1,7 @@
-import sqlite3
 import hashlib
 from datetime import datetime, timedelta
 
-from scripts.init_db import DB_PATH
+from app.db import get_connection, get_db_path
 
 
 def normalize_text(value: str | None) -> str | None:
@@ -290,6 +289,7 @@ def build_seed_rows():
             item["summary"].strip(),
             event_date,
             published_date,
+            item["days_ago"],
             item["address_text"],
             item["location_text"],
             normalize_text(item["city"]) if item["city"] else None,
@@ -310,7 +310,7 @@ def build_seed_rows():
 def main() -> None:
     rows = build_seed_rows()
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     try:
         cursor = conn.cursor()
 
@@ -323,6 +323,7 @@ def main() -> None:
                 summary,
                 event_date,
                 published_date,
+                days_ago,
                 address_text,
                 location_text,
                 city,
@@ -336,17 +337,17 @@ def main() -> None:
                 source_priority,
                 duplicate_group_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
 
         conn.commit()
 
-        cursor.execute("SELECT COUNT(*) FROM incidents")
-        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) AS total FROM incidents")
+        total = cursor.fetchone()["total"]
 
-        print(f"incidents seeded")
+        print("incidents seeded")
         print(f"total incidents in db: {total}")
-        print(f"db path: {DB_PATH}")
+        print(f"db path: {get_db_path()}")
     finally:
         conn.close()
 

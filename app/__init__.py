@@ -2,7 +2,7 @@ import sqlite3
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "lazarus_safe_v2.db"
+DB_PATH = BASE_DIR / "lazarus_safe.db"
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;

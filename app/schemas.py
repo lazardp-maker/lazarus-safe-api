@@ -1,5 +1,4 @@
 from typing import Optional
-
 from pydantic import BaseModel, Field
 
 
@@ -16,42 +15,14 @@ class IncidentsSummary(BaseModel):
 
 
 class AnalyzeRequest(BaseModel):
-    lat: float = Field(
-        ...,
-        ge=-90,
-        le=90,
-        description="Latitudinea utilizatorului",
-    )
-    lng: float = Field(
-        ...,
-        ge=-180,
-        le=180,
-        description="Longitudinea utilizatorului",
-    )
+    lat: float = Field(..., ge=-90, le=90, description="Latitudinea utilizatorului")
+    lng: float = Field(..., ge=-180, le=180, description="Longitudinea utilizatorului")
 
 
 class AnalyzeResponse(BaseModel):
-    level: str = Field(
-        ...,
-        description="Nivelul de risc afișat utilizatorului",
-    )
-    message: str = Field(
-        ...,
-        description="Mesaj clar, pe înțelesul utilizatorului",
-    )
-    county: Optional[str] = Field(
-        default=None,
-        description="Județul detectat",
-    )
-    city: Optional[str] = Field(
-        default=None,
-        description="Orașul sau localitatea detectată",
-    )
-    incidents_summary: IncidentsSummary = Field(
-        ...,
-        description="Sumar al incidentelor relevante pentru zonă",
-    )
-    sources_used: list[str] = Field(
-        default_factory=list,
-        description="Lista surselor folosite în analiză",
-    )
+    level: str = Field(..., description="Nivelul de risc afișat utilizatorului")
+    message: str = Field(..., description="Mesaj clar, pe înțelesul utilizatorului")
+    county: Optional[str] = Field(default=None, description="Județul detectat")
+    city: Optional[str] = Field(default=None, description="Orașul sau localitatea detectată")
+    incidents_summary: IncidentsSummary = Field(..., description="Sumar al incidentelor relevante pentru zonă")
+    sources_used: list[str] = Field(default_factory=list, description="Lista surselor folosite în analiză")

@@ -1,8 +1,5 @@
-import sqlite3
-from pathlib import Path
-
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "lazarus_safe_v2.db"
+DB_PATH = BASE_DIR / "lazarus_safe.db"
 
 
 def main():
@@ -13,7 +10,9 @@ def main():
         print("Database file not found.")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    from app.db import get_connection
+
+conn = get_connection()
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
 

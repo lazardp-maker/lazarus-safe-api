@@ -5,46 +5,59 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-from scripts.init_db import initialize_database
-import scripts.seed_sources as seed_sources_script
-import scripts.seed_area_profiles as seed_area_profiles_script
-
-from app.schemas import AnalyzeRequest, AnalyzeResponse
+from app.db import (
+    get_connection,
+    get_db_path,
+    initialize_database,
+    list_tables,
+    validate_critical_tables,
+)
 from app.risk_engine import evaluate_risk, get_sources_used
+from app.schemas import AnalyzeRequest, AnalyzeResponse
+
+import scripts.seed_area_profiles as seed_area_profiles_script
+import scripts.seed_sources as seed_sources_script
 
 
 app = FastAPI(
     title="Lazarus Safe API",
-    version="2.0.0",
-    description="API pentru evaluarea riscului de securitate fizică pe baza locației."
+    version="2.1.0",
+    description="API pentru evaluarea riscului de securitate fizică pe baza locației.",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
 @app.on_event("startup")
 def startup_event() -> None:
-    print("🚀 Initializing database...")
+    print("[startup] Initializing database...")
     initialize_database()
+    validate_critical_tables()
+
+    try:
+        with get_connection() as conn:
+            print(f"[startup] DB path: {get_db_path()}")
+            print(f"[startup] Tables: {list_tables(conn)}")
+    except Exception as exc:
+        print(f"[startup] DB inspection error: {exc}")
 
     try:
         seed_sources_script.main()
-        print("✅ sources seeded")
-    except Exception as e:
-        print(f"seed_sources error: {e}")
+        print("[startup] sources seeded")
+    except Exception as exc:
+        print(f"[startup] seed_sources error: {exc}")
 
     try:
         seed_area_profiles_script.main()
-        print("✅ area profiles seeded")
-    except Exception as e:
-        print(f"seed_area_profiles error: {e}")
-
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+        print("[startup] area profiles seeded")
+    except Exception as exc:
+        print(f"[startup] seed_area_profiles error: {exc}")
 
 
 def normalize_text(value: Optional[str]) -> Optional[str]:
@@ -65,64 +78,96 @@ def normalize_text(value: Optional[str]) -> Optional[str]:
     for old, new in replacements.items():
         value = value.replace(old, new)
 
-    value = " ".join(value.split())
-    return value
+    return " ".join(value.split())
+
+
+def canonicalize_place(value: Optional[str]) -> Optional[str]:
+    value = normalize_text(value)
+    if not value:
+        return None
+
+    prefixes = [
+        "municipiul ",
+        "judetul ",
+        "judet ",
+        "orasul ",
+        "oras ",
+        "comuna ",
+        "county of ",
+        "county ",
+    ]
+
+    for prefix in prefixes:
+        if value.startswith(prefix):
+            value = value[len(prefix):].strip()
+
+    aliases = {
+        "bucharest": "bucuresti",
+        "municipiul bucuresti": "bucuresti",
+        "sector 1": "bucuresti",
+        "sector 2": "bucuresti",
+        "sector 3": "bucuresti",
+        "sector 4": "bucuresti",
+        "sector 5": "bucuresti",
+        "sector 6": "bucuresti",
+    }
+
+    return aliases.get(value, value)
 
 
 def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optional[str]]:
-    print(f"[geocode] input lat={lat}, lng={lng}")
-
     url = "https://nominatim.openstreetmap.org/reverse"
-
     headers = {
-        "User-Agent": "Mozilla/5.0 LazarusSafeApp",
+        "User-Agent": "LazarusSafeApp/2.1 (contact: lazardp@gmail.com)",
         "Accept": "application/json",
     }
-
     params = {
         "lat": lat,
         "lon": lng,
-        "format": "json",
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "accept-language": "ro",
     }
 
     try:
         response = requests.get(url, params=params, headers=headers, timeout=10)
-
-        print(f"[geocode] status_code={response.status_code}")
-
-        if response.status_code != 200:
-            print(f"[geocode] failed response: {response.text[:300]}")
-            raise Exception("Bad response")
+        response.raise_for_status()
 
         data = response.json()
-        print(f"[geocode] response OK")
-
         address = data.get("address", {})
 
-        county = (
+        raw_county = (
             address.get("county")
+            or address.get("state_district")
             or address.get("state")
         )
 
-        city = (
+        raw_city = (
             address.get("city")
+            or address.get("municipality")
             or address.get("town")
             or address.get("village")
+            or address.get("suburb")
+            or address.get("city_district")
         )
 
-        county_n = normalize_text(county)
-        city_n = normalize_text(city)
+        county = canonicalize_place(raw_county)
+        city = canonicalize_place(raw_city)
 
-        print(f"[geocode] parsed county={county_n}, city={city_n}")
+        if county == "bucuresti":
+            city = "bucuresti"
 
-        if county_n:
-            return county_n, city_n
+        print(
+            f"[geocode] lat={lat} lng={lng} "
+            f"raw_county={raw_county} raw_city={raw_city} "
+            f"county={county} city={city}"
+        )
 
-    except Exception as e:
-        print(f"[geocode] ERROR: {e}")
+        if county:
+            return county, city
 
-    # 🔥 FALLBACK INTELIGENT (CRITIC)
-    print("[geocode] fallback activated")
+    except Exception as exc:
+        print(f"[geocode] error lat={lat} lng={lng}: {exc}")
 
     if 44.3 <= lat <= 44.6 and 25.9 <= lng <= 26.3:
         return "bucuresti", "bucuresti"
@@ -131,6 +176,7 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
         return "arges", "pitesti"
 
     return None, None
+
 
 def empty_incidents_summary() -> dict:
     return {
@@ -159,16 +205,37 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
             sources_used=[],
         )
 
-    result = evaluate_risk(county, city)
-    sources_used = get_sources_used(county)
+    try:
+        result = evaluate_risk(county, city)
+        sources_used = get_sources_used(county, city)
+    except Exception as exc:
+        print(f"[risk_engine] county={county} city={city} error={exc}")
+        return AnalyzeResponse(
+            level="UNKNOWN",
+            message="Locația a fost identificată, dar analiza de risc a eșuat.",
+            county=county,
+            city=city,
+            incidents_summary=empty_incidents_summary(),
+            sources_used=[],
+        )
+
+    if not isinstance(result, dict):
+        return AnalyzeResponse(
+            level="UNKNOWN",
+            message="Analiza nu a returnat un rezultat valid.",
+            county=county,
+            city=city,
+            incidents_summary=empty_incidents_summary(),
+            sources_used=[],
+        )
 
     return AnalyzeResponse(
-        level=result["level"],
-        message=result["message"],
+        level=result.get("level", "UNKNOWN"),
+        message=result.get("message", "Analiza nu a putut fi completată."),
         county=county,
         city=city,
-        incidents_summary=result["incidents_summary"],
-        sources_used=sources_used,
+        incidents_summary=result.get("incidents_summary", empty_incidents_summary()),
+        sources_used=sources_used if isinstance(sources_used, list) else [],
     )
 
 
@@ -178,47 +245,28 @@ def home() -> str:
     <html>
         <head>
             <title>Lazarus Safe API</title>
-            <style>
-                body {
-                    font-family: Arial, sans-serif;
-                    background: #0b1736;
-                    color: white;
-                    padding: 40px;
-                }
-                .box {
-                    max-width: 760px;
-                    margin: auto;
-                    background: #142554;
-                    padding: 24px;
-                    border-radius: 16px;
-                    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.25);
-                }
-                code {
-                    color: #ffd27d;
-                    font-size: 16px;
-                }
-                h1 {
-                    margin-top: 0;
-                }
-                p {
-                    line-height: 1.6;
-                }
-            </style>
         </head>
-        <body>
-            <div class="box">
+        <body style="font-family: Arial, sans-serif; background:#0b1736; color:white; padding:40px;">
+            <div style="max-width:760px;margin:auto;background:#142554;padding:24px;border-radius:16px;">
                 <h1>Lazarus Safe API</h1>
-                <p>Evaluator de risc la securitate fizică - Lazar Vasile</p>
-                <p><strong>Endpoint principal:</strong></p>
-                <p><code>POST /analyze</code></p>
-                <p><strong>Endpoint alternativ:</strong></p>
-                <p><code>POST /location-risk</code></p>
-                <p><strong>Documentație Swagger:</strong></p>
-                <p><code>/docs</code></p>
+                <p>Evaluator de risc la securitate fizică</p>
+                <p><strong>Endpoint principal:</strong> <code>POST /analyze</code></p>
+                <p><strong>Endpoint alternativ:</strong> <code>POST /location-risk</code></p>
+                <p><strong>Documentație:</strong> <code>/docs</code></p>
+                <p><strong>Health:</strong> <code>/health</code></p>
+                <p><strong>Debug DB:</strong> <code>/debug/db</code></p>
             </div>
         </body>
     </html>
     """
+
+
+@app.get("/debug/db")
+def debug_db() -> dict:
+    return {
+        "db_path": get_db_path(),
+        "tables": list_tables(),
+    }
 
 
 @app.get("/health")

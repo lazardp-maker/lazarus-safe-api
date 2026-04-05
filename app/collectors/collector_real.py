@@ -3,15 +3,14 @@ import logging
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "lazarus_safe_v2.db"
+from app.db import get_connection, get_db_path
+
 
 REQUEST_TIMEOUT = 12
 MAX_LINKS_PER_SOURCE = 60
@@ -80,17 +79,17 @@ NOISE_KEYWORDS = [
 
 INCIDENT_RULES = {
     "homicide": {
-        "severity": "ridicat",
+        "severity": "high",
         "keywords": [
-            "omor", "omorat", "omorat", "omorare", "omorare",
-            "omucidere", "ucis", "ucisa", "ucisa",
+            "omor", "omorat", "omorare",
+            "omucidere", "ucis", "ucisa",
             "a fost ucis", "fost ucisa", "fost ucis",
             "femicid", "crima", "crimă", "asasinat",
             "mort in urma agresiunii", "mort în urma agresiunii",
         ],
     },
     "sexual_violence": {
-        "severity": "ridicat",
+        "severity": "critical",
         "keywords": [
             "viol", "violat", "violata", "violată", "violator",
             "agresiune sexuala", "agresiune sexuală",
@@ -99,14 +98,14 @@ INCIDENT_RULES = {
         ],
     },
     "robbery": {
-        "severity": "ridicat",
+        "severity": "high",
         "keywords": [
             "talhar", "tâlhar", "talharie", "tâlhărie",
             "jaf", "jefuit", "jefuire",
         ],
     },
     "theft": {
-        "severity": "mediu",
+        "severity": "medium",
         "keywords": [
             "furt", "furturi", "hot", "hoț", "hoti", "hoți",
             "buzunare", "buzunar", "sustras", "sustragere",
@@ -114,7 +113,7 @@ INCIDENT_RULES = {
         ],
     },
     "violence": {
-        "severity": "ridicat",
+        "severity": "high",
         "keywords": [
             "agresiune", "agresiuni", "lovire", "loviri",
             "bataie", "bătaie", "batai", "bătăi",
@@ -124,7 +123,7 @@ INCIDENT_RULES = {
         ],
     },
     "traffic": {
-        "severity": "mediu",
+        "severity": "medium",
         "keywords": [
             "accident", "accident rutier", "coliziune", "impact",
             "autoturism", "autovehicul",
@@ -134,7 +133,7 @@ INCIDENT_RULES = {
         ],
     },
     "emergency": {
-        "severity": "ridicat",
+        "severity": "high",
         "keywords": [
             "incendiu", "incendii", "explozie",
             "flacari", "flăcări", "ardere", "a luat foc",
@@ -142,7 +141,7 @@ INCIDENT_RULES = {
         ],
     },
     "public_order": {
-        "severity": "mediu",
+        "severity": "low",
         "keywords": [
             "tulburarea ordinii publice",
             "tulburarea linistii publice",
@@ -179,35 +178,31 @@ def clean_text(text: str) -> str:
     return " ".join(text.split()).strip()
 
 
-def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
 def get_active_sources() -> list[SourceItem]:
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, name, base_url, county, city, trust_level
-        FROM sources
-        WHERE is_active = 1
-        ORDER BY trust_level DESC, id ASC
-    """)
-    rows = cursor.fetchall()
-    conn.close()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, name, base_url, county, city, trust_level
+            FROM sources
+            WHERE is_active = 1
+            ORDER BY trust_level DESC, id ASC
+        """)
+        rows = cursor.fetchall()
 
-    return [
-        SourceItem(
-            id=row["id"],
-            name=row["name"],
-            base_url=row["base_url"],
-            county=normalize_text(row["county"]),
-            city=normalize_text(row["city"]),
-            trust_level=row["trust_level"],
-        )
-        for row in rows
-    ]
+        return [
+            SourceItem(
+                id=row["id"],
+                name=row["name"],
+                base_url=row["base_url"],
+                county=normalize_text(row["county"]),
+                city=normalize_text(row["city"]),
+                trust_level=row["trust_level"],
+            )
+            for row in rows
+        ]
+    finally:
+        conn.close()
 
 
 def fetch_page(session: requests.Session, url: str) -> Optional[str]:
@@ -327,16 +322,18 @@ def build_incident_uid(source_id: int, article_url: str, title: str) -> str:
 
 def incident_exists(incident_uid: str) -> bool:
     conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT 1
-        FROM incidents
-        WHERE incident_uid = ?
-        LIMIT 1
-    """, (incident_uid,))
-    row = cursor.fetchone()
-    conn.close()
-    return row is not None
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT 1
+            FROM incidents
+            WHERE incident_uid = ?
+            LIMIT 1
+        """, (incident_uid,))
+        row = cursor.fetchone()
+        return row is not None
+    finally:
+        conn.close()
 
 
 def save_incident(
@@ -356,8 +353,8 @@ def save_incident(
     now_iso = datetime.now(timezone.utc).isoformat()
 
     conn = get_connection()
-    cursor = conn.cursor()
     try:
+        cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO incidents (
                 incident_uid,
@@ -450,7 +447,7 @@ def process_source(session: requests.Session, source: SourceItem) -> None:
         incident_type, severity = classify_incident(combined_text)
         processed += 1
 
-        if not incident_type:
+        if not incident_type or not severity:
             continue
 
         incident_count += 1
@@ -465,17 +462,15 @@ def process_source(session: requests.Session, source: SourceItem) -> None:
             severity_level=severity,
         )
 
-    logging.info("Sursa %s | articole procesate: %s | incidente detectate: %s",
-                 source.name, processed, incident_count)
+    logging.info(
+        "Sursa %s | articole procesate: %s | incidente detectate: %s",
+        source.name, processed, incident_count
+    )
 
 
 def main() -> None:
-    logging.info("Pornire collector_real v2")
-    logging.info("DB: %s", DB_PATH)
-
-    if not DB_PATH.exists():
-        logging.error("Baza de date nu exista: %s", DB_PATH)
-        return
+    logging.info("Pornire collector_real")
+    logging.info("DB: %s", get_db_path())
 
     sources = get_active_sources()
     logging.info("Surse active incarcate: %s", len(sources))

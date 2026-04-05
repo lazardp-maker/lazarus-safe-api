@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Optional, Any
+from typing import Any, Optional
 
 from app.db import get_connection
+
 
 DEFAULT_LOOKBACK_DAYS = 60
 
@@ -56,29 +57,67 @@ def normalize_text(value: Optional[str]) -> Optional[str]:
     for old, new in replacements.items():
         value = value.replace(old, new)
 
+    value = " ".join(value.split())
+
     prefixes = (
         "județul ",
         "judetul ",
         "municipiul ",
-        "orașul ",
         "orasul ",
+        "orașul ",
         "oras ",
         "oraș ",
+        "municipality of ",
+        "county of ",
+        "county ",
+        "city of ",
+        "comuna ",
     )
     for prefix in prefixes:
         if value.startswith(prefix):
-            value = value[len(prefix):]
+            value = value[len(prefix):].strip()
 
-    return value.strip()
+    aliases = {
+        "bucharest": "bucuresti",
+        "bucurești": "bucuresti",
+        "municipiul bucuresti": "bucuresti",
+        "sector 1": "bucuresti",
+        "sector 2": "bucuresti",
+        "sector 3": "bucuresti",
+        "sector 4": "bucuresti",
+        "sector 5": "bucuresti",
+        "sector 6": "bucuresti",
+        "cluj napoca": "cluj-napoca",
+        "tirgu mures": "targu mures",
+        "tirgu- mures": "targu mures",
+    }
+
+    return aliases.get(value, value)
+
+
+def safe_float(value: Any, default: float = 1.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def empty_counts() -> dict[str, int]:
     return {key: 0 for key in INCIDENT_KEYS}
 
 
+def clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(value, max_value))
+
+
 def get_area_profile(county: str, city: Optional[str] = None):
     county_n = normalize_text(county)
     city_n = normalize_text(city) if city else None
+
+    if not county_n:
+        return None
 
     with get_connection() as conn:
         cursor = conn.cursor()
@@ -87,13 +126,20 @@ def get_area_profile(county: str, city: Optional[str] = None):
             cursor.execute(
                 """
                 SELECT
+                    id,
+                    county,
+                    city,
+                    locality_type,
                     crime_coefficient,
                     violence_coefficient,
                     theft_coefficient,
                     traffic_coefficient,
-                    emergency_coefficient
+                    emergency_coefficient,
+                    source_note
                 FROM area_risk_profiles
-                WHERE county = ? AND city = ?
+                WHERE county = ?
+                  AND city = ?
+                  AND locality_type IN ('city', 'sector', 'commune', 'village')
                 ORDER BY id DESC
                 LIMIT 1
                 """,
@@ -106,19 +152,48 @@ def get_area_profile(county: str, city: Optional[str] = None):
         cursor.execute(
             """
             SELECT
+                id,
+                county,
+                city,
+                locality_type,
                 crime_coefficient,
                 violence_coefficient,
                 theft_coefficient,
                 traffic_coefficient,
-                emergency_coefficient
+                emergency_coefficient,
+                source_note
             FROM area_risk_profiles
-            WHERE county = ? AND city IS NULL
+            WHERE county = ?
+              AND (city = '' OR city IS NULL)
+              AND locality_type = 'county'
             ORDER BY id DESC
             LIMIT 1
             """,
             (county_n,),
         )
         return cursor.fetchone()
+
+
+def build_incident_where_clause(
+    county_n: Optional[str],
+    city_n: Optional[str],
+    lookback_days: int,
+) -> tuple[str, list[Any]]:
+    where_parts = [
+        "date(COALESCE(event_date, published_date)) IS NOT NULL",
+        "date(COALESCE(event_date, published_date)) >= date('now', ?)",
+    ]
+    params: list[Any] = [f"-{lookback_days} days"]
+
+    if county_n and city_n:
+        where_parts.append("county = ?")
+        where_parts.append("(city = ? OR city IS NULL OR city = '')")
+        params.extend([county_n, city_n])
+    elif county_n:
+        where_parts.append("county = ?")
+        params.append(county_n)
+
+    return " AND ".join(where_parts), params
 
 
 def get_recent_incident_counts(
@@ -131,20 +206,10 @@ def get_recent_incident_counts(
     county_n = normalize_text(county) if county else None
     city_n = normalize_text(city) if city else None
 
-    where_parts = [
-        "date(COALESCE(event_date, published_date)) >= date('now', ?)"
-    ]
-    params: list[Any] = [f"-{lookback_days} days"]
+    if not county_n:
+        return counts
 
-    if county_n and city_n:
-        where_parts.append("county = ?")
-        where_parts.append("(city = ? OR city IS NULL)")
-        params.extend([county_n, city_n])
-    elif county_n:
-        where_parts.append("county = ?")
-        params.append(county_n)
-
-    where_sql = " AND ".join(where_parts)
+    where_sql, params = build_incident_where_clause(county_n, city_n, lookback_days)
 
     query = f"""
         SELECT incident_type, COUNT(*) AS total
@@ -163,9 +228,9 @@ def get_recent_incident_counts(
         total = row["total"]
 
         if incident_type in counts:
-            counts[incident_type] = total
+            counts[incident_type] = int(total)
         else:
-            counts["general"] += total
+            counts["general"] += int(total)
 
     return counts
 
@@ -178,20 +243,10 @@ def get_weighted_incident_score(
     county_n = normalize_text(county) if county else None
     city_n = normalize_text(city) if city else None
 
-    where_parts = [
-        "date(COALESCE(event_date, published_date)) >= date('now', ?)"
-    ]
-    params: list[Any] = [f"-{lookback_days} days"]
+    if not county_n:
+        return 0.0
 
-    if county_n and city_n:
-        where_parts.append("county = ?")
-        where_parts.append("(city = ? OR city IS NULL)")
-        params.extend([county_n, city_n])
-    elif county_n:
-        where_parts.append("county = ?")
-        params.append(county_n)
-
-    where_sql = " AND ".join(where_parts)
+    where_sql, params = build_incident_where_clause(county_n, city_n, lookback_days)
 
     query = f"""
         SELECT
@@ -213,92 +268,14 @@ def get_weighted_incident_score(
     for row in rows:
         incident_type = row["incident_type"]
         severity = row["severity_level"]
-        total = row["total"]
+        total = int(row["total"])
 
         base_weight = BASE_WEIGHTS.get(incident_type, BASE_WEIGHTS["general"])
         severity_multiplier = SEVERITY_MULTIPLIERS.get(severity, 1.0)
 
         score += total * base_weight * severity_multiplier
 
-    return score
-
-
-def insert_source(
-    name: str,
-    source_type: str,
-    base_url: str,
-    county: Optional[str] = None,
-    city: Optional[str] = None,
-    trust_level: int = 3,
-    is_active: int = 1,
-) -> int:
-    county_n = normalize_text(county) if county else None
-    city_n = normalize_text(city) if city else None
-    name_n = name.strip()
-    source_type_n = source_type.strip().lower()
-    base_url_n = base_url.strip()
-
-    with get_connection() as conn:
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            SELECT id
-            FROM sources
-            WHERE name = ?
-              AND source_type = ?
-              AND base_url = ?
-              AND (
-                    (county = ?)
-                    OR (county IS NULL AND ? IS NULL)
-                  )
-              AND (
-                    (city = ?)
-                    OR (city IS NULL AND ? IS NULL)
-                  )
-            LIMIT 1
-            """,
-            (
-                name_n,
-                source_type_n,
-                base_url_n,
-                county_n,
-                county_n,
-                city_n,
-                city_n,
-            ),
-        )
-
-        existing = cursor.fetchone()
-        if existing:
-            return existing["id"]
-
-        cursor.execute(
-            """
-            INSERT INTO sources (
-                name,
-                source_type,
-                base_url,
-                county,
-                city,
-                trust_level,
-                is_active
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                name_n,
-                source_type_n,
-                base_url_n,
-                county_n,
-                city_n,
-                trust_level,
-                is_active,
-            ),
-        )
-
-        conn.commit()
-        return cursor.lastrowid
+    return round(score, 2)
 
 
 def get_sources_used(county: Optional[str] = None, city: Optional[str] = None) -> list[str]:
@@ -310,7 +287,7 @@ def get_sources_used(county: Optional[str] = None, city: Optional[str] = None) -
 
     if county_n and city_n:
         where_parts.append("(county = ? OR county IS NULL)")
-        where_parts.append("(city = ? OR city IS NULL)")
+        where_parts.append("(city = ? OR city IS NULL OR city = '')")
         params.extend([county_n, city_n])
     elif county_n:
         where_parts.append("(county = ? OR county IS NULL)")
@@ -353,7 +330,23 @@ def build_reason_message(counts: dict[str, int]) -> str:
         return "Au fost identificate incidente rutiere repetate în zona analizată."
     if counts["emergency"] >= 2:
         return "Au fost identificate urgențe recente care justifică prudență."
-    return "Zona analizată nu indică în acest moment un nivel ridicat de incidente relevante."
+    if sum(counts.values()) == 0:
+        return "Nu au fost identificate incidente relevante în fereastra recentă analizată."
+    return "Zona analizată prezintă unele incidente recente care justifică atenție moderată."
+
+
+def classify_level(adjusted_score: float, counts: dict[str, int]) -> str:
+    if counts["homicide"] >= 1:
+        return "Atenționare serioasă"
+    if counts["sexual_violence"] >= 1 and adjusted_score >= 8:
+        return "Atenționare serioasă"
+    if adjusted_score < 6:
+        return "Situație stabilă"
+    if adjusted_score < 12:
+        return "Prudență"
+    if adjusted_score < 20:
+        return "Prudență ridicată"
+    return "Atenționare serioasă"
 
 
 def evaluate_risk(
@@ -361,18 +354,25 @@ def evaluate_risk(
     city: Optional[str] = None,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
 ) -> dict[str, Any]:
-    if not county:
+    county_n = normalize_text(county) if county else None
+    city_n = normalize_text(city) if city else None
+
+    if not county_n:
         return {
             "level": "Date insuficiente",
             "message": "Nu s-a putut determina zona utilizatorului.",
-            "incidents_summary": get_recent_incident_counts(
-                lookback_days=lookback_days
-            ),
+            "incidents_summary": empty_counts(),
             "score_internal": 0.0,
+            "meta": {
+                "county": None,
+                "city": None,
+                "profile_found": False,
+                "lookback_days": lookback_days,
+            },
         }
 
-    profile = get_area_profile(county, city)
-    counts = get_recent_incident_counts(county, city, lookback_days=lookback_days)
+    profile = get_area_profile(county_n, city_n)
+    counts = get_recent_incident_counts(county_n, city_n, lookback_days=lookback_days)
 
     if not profile:
         return {
@@ -380,38 +380,31 @@ def evaluate_risk(
             "message": "Nu există încă suficiente date pentru evaluarea zonei.",
             "incidents_summary": counts,
             "score_internal": 0.0,
+            "meta": {
+                "county": county_n,
+                "city": city_n,
+                "profile_found": False,
+                "lookback_days": lookback_days,
+            },
         }
 
-    crime_c = float(profile["crime_coefficient"])
-    violence_c = float(profile["violence_coefficient"])
-    theft_c = float(profile["theft_coefficient"])
-    traffic_c = float(profile["traffic_coefficient"])
-    emergency_c = float(profile["emergency_coefficient"])
+    crime_c = safe_float(profile["crime_coefficient"], 1.0)
+    violence_c = safe_float(profile["violence_coefficient"], 1.0)
+    theft_c = safe_float(profile["theft_coefficient"], 1.0)
+    traffic_c = safe_float(profile["traffic_coefficient"], 1.0)
+    emergency_c = safe_float(profile["emergency_coefficient"], 1.0)
 
-    weighted_score = get_weighted_incident_score(
-        county, city, lookback_days=lookback_days
-    )
+    weighted_score = get_weighted_incident_score(county_n, city_n, lookback_days=lookback_days)
 
     adjusted_score = weighted_score
-    adjusted_score += counts["violence"] * (violence_c - 1.0) * 2.0
-    adjusted_score += counts["theft"] * (theft_c - 1.0) * 1.5
-    adjusted_score += counts["traffic"] * (traffic_c - 1.0) * 1.2
-    adjusted_score += counts["emergency"] * (emergency_c - 1.0) * 1.2
-    adjusted_score *= crime_c
+    adjusted_score += counts["violence"] * max(0.0, violence_c - 1.0) * 2.0
+    adjusted_score += counts["theft"] * max(0.0, theft_c - 1.0) * 1.5
+    adjusted_score += counts["traffic"] * max(0.0, traffic_c - 1.0) * 1.2
+    adjusted_score += counts["emergency"] * max(0.0, emergency_c - 1.0) * 1.2
+    adjusted_score *= max(0.1, crime_c)
+    adjusted_score = clamp(round(adjusted_score, 2), 0.0, 999.0)
 
-    if counts["homicide"] >= 1:
-        level = "Atenționare serioasă"
-    elif counts["sexual_violence"] >= 1 and adjusted_score >= 8:
-        level = "Atenționare serioasă"
-    elif adjusted_score < 6:
-        level = "Situație stabilă"
-    elif adjusted_score < 12:
-        level = "Prudență"
-    elif adjusted_score < 20:
-        level = "Prudență ridicată"
-    else:
-        level = "Atenționare serioasă"
-
+    level = classify_level(adjusted_score, counts)
     base_reason = build_reason_message(counts)
 
     if level == "Situație stabilă":
@@ -419,18 +412,26 @@ def evaluate_risk(
     elif level == "Prudență":
         message = f"{base_reason} Se recomandă atenție și prudență în deplasare."
     elif level == "Prudență ridicată":
-        message = (
-            f"{base_reason} Se recomandă evitarea expunerii inutile și atenție sporită."
-        )
+        message = f"{base_reason} Se recomandă evitarea expunerii inutile și atenție sporită."
     else:
-        message = (
-            f"{base_reason} Se recomandă vigilență maximă și evitarea zonelor sau "
-            f"intervalelor vulnerabile."
-        )
+        message = f"{base_reason} Se recomandă vigilență maximă și evitarea zonelor sau intervalelor vulnerabile."
 
     return {
         "level": level,
         "message": message,
         "incidents_summary": counts,
-        "score_internal": round(adjusted_score, 2),
+        "score_internal": adjusted_score,
+        "meta": {
+            "county": county_n,
+            "city": city_n,
+            "profile_found": True,
+            "profile_locality_type": profile["locality_type"],
+            "lookback_days": lookback_days,
+            "weighted_score": weighted_score,
+            "crime_coefficient": crime_c,
+            "violence_coefficient": violence_c,
+            "theft_coefficient": theft_c,
+            "traffic_coefficient": traffic_c,
+            "emergency_coefficient": emergency_c,
+        },
     }

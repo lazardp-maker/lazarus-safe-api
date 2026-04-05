@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Optional, Iterable
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-DB_PATH = BASE_DIR / "lazarus_safe_v2.db"
+DB_PATH = BASE_DIR / "lazarus_safe.db"
 
 
 def normalize_name(value: Optional[str]) -> str:
