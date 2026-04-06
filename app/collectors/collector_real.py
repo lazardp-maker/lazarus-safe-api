@@ -1,26 +1,25 @@
-import hashlib
 import logging
-import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
+from app.collectors.parsers import build_parser_result, normalize_text
 from app.db import get_connection, get_db_path
 
 
-REQUEST_TIMEOUT = 12
-MAX_LINKS_PER_SOURCE = 60
-MAX_ARTICLES_TO_PROCESS = 20
-MIN_TITLE_LEN = 20
-MIN_CONTENT_LEN = 80
+REQUEST_TIMEOUT = 15
+MAX_LINKS_PER_SOURCE = 80
+MAX_ARTICLES_TO_PROCESS = 25
+MIN_TITLE_LEN = 18
+MIN_CONTENT_LEN = 120
+MIN_AI_CONFIDENCE = 0.62
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
 
@@ -28,6 +27,7 @@ logging.basicConfig(
 class SourceItem:
     id: int
     name: str
+    source_type: str
     base_url: str
     county: Optional[str]
     city: Optional[str]
@@ -65,8 +65,6 @@ NOISE_KEYWORDS = [
     "proiectului",
     "imbunatatirea rezilientei",
     "îmbunătățirea rezilienței",
-    "situatii de urgenta",
-    "situații de urgență",
     "cumpara in siguranta",
     "cumpără în siguranță",
     "prioritatea politistilor",
@@ -76,102 +74,6 @@ NOISE_KEYWORDS = [
     "acțiune integrată",
     "transparentei intereselor",
 ]
-
-INCIDENT_RULES = {
-    "homicide": {
-        "severity": "high",
-        "keywords": [
-            "omor", "omorat", "omorare",
-            "omucidere", "ucis", "ucisa",
-            "a fost ucis", "fost ucisa", "fost ucis",
-            "femicid", "crima", "crimă", "asasinat",
-            "mort in urma agresiunii", "mort în urma agresiunii",
-        ],
-    },
-    "sexual_violence": {
-        "severity": "critical",
-        "keywords": [
-            "viol", "violat", "violata", "violată", "violator",
-            "agresiune sexuala", "agresiune sexuală",
-            "abuz sexual", "act sexual",
-            "trafic de persoane", "exploatare sexuala", "exploatare sexuală",
-        ],
-    },
-    "robbery": {
-        "severity": "high",
-        "keywords": [
-            "talhar", "tâlhar", "talharie", "tâlhărie",
-            "jaf", "jefuit", "jefuire",
-        ],
-    },
-    "theft": {
-        "severity": "medium",
-        "keywords": [
-            "furt", "furturi", "hot", "hoț", "hoti", "hoți",
-            "buzunare", "buzunar", "sustras", "sustragere",
-            "spargere", "a furat", "au furat",
-        ],
-    },
-    "violence": {
-        "severity": "high",
-        "keywords": [
-            "agresiune", "agresiuni", "lovire", "loviri",
-            "bataie", "bătaie", "batai", "bătăi",
-            "atac", "conflict violent", "scandal violent",
-            "injunghiat", "înjunghiat", "injunghiere", "înjunghiere",
-            "arme albe", "arma alba", "armă albă",
-        ],
-    },
-    "traffic": {
-        "severity": "medium",
-        "keywords": [
-            "accident", "accident rutier", "coliziune", "impact",
-            "autoturism", "autovehicul",
-            "ranit", "rănit", "raniti", "răniți",
-            "decedat in accident", "decedat în accident",
-            "pieton", "tamponare",
-        ],
-    },
-    "emergency": {
-        "severity": "high",
-        "keywords": [
-            "incendiu", "incendii", "explozie",
-            "flacari", "flăcări", "ardere", "a luat foc",
-            "fum dens", "interventia pompierilor", "intervenția pompierilor",
-        ],
-    },
-    "public_order": {
-        "severity": "low",
-        "keywords": [
-            "tulburarea ordinii publice",
-            "tulburarea linistii publice",
-            "tulburarea liniștii publice",
-            "ordine publica",
-            "ordine publică",
-            "scandal",
-        ],
-    },
-}
-
-
-def normalize_text(value: Optional[str]) -> Optional[str]:
-    if value is None:
-        return None
-
-    value = value.lower().strip()
-    replacements = {
-        "ă": "a",
-        "â": "a",
-        "î": "i",
-        "ș": "s",
-        "ş": "s",
-        "ț": "t",
-        "ţ": "t",
-    }
-    for old, new in replacements.items():
-        value = value.replace(old, new)
-
-    return " ".join(value.split())
 
 
 def clean_text(text: str) -> str:
@@ -183,7 +85,7 @@ def get_active_sources() -> list[SourceItem]:
     try:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT id, name, base_url, county, city, trust_level
+            SELECT id, name, source_type, base_url, county, city, trust_level
             FROM sources
             WHERE is_active = 1
             ORDER BY trust_level DESC, id ASC
@@ -194,9 +96,10 @@ def get_active_sources() -> list[SourceItem]:
             SourceItem(
                 id=row["id"],
                 name=row["name"],
+                source_type=row["source_type"],
                 base_url=row["base_url"],
-                county=normalize_text(row["county"]),
-                city=normalize_text(row["city"]),
+                county=normalize_text(row["county"]) or None,
+                city=normalize_text(row["city"]) or None,
                 trust_level=row["trust_level"],
             )
             for row in rows
@@ -210,7 +113,7 @@ def fetch_page(session: requests.Session, url: str) -> Optional[str]:
         response = session.get(
             url,
             timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "Mozilla/5.0 LazarusSafeCollector/2.0"},
+            headers={"User-Agent": "Mozilla/5.0 LazarusSafeCollector/3.0"},
         )
         response.raise_for_status()
 
@@ -231,14 +134,6 @@ def is_noise(text: str) -> bool:
     return any(keyword in t for keyword in NOISE_KEYWORDS)
 
 
-def classify_incident(text: str) -> tuple[Optional[str], Optional[str]]:
-    t = normalize_text(text) or ""
-    for incident_type, config in INCIDENT_RULES.items():
-        if any(keyword in t for keyword in config["keywords"]):
-            return incident_type, config["severity"]
-    return None, None
-
-
 def same_domain(base_url: str, candidate_url: str) -> bool:
     base_netloc = urlparse(base_url).netloc.lower().replace("www.", "")
     cand_netloc = urlparse(candidate_url).netloc.lower().replace("www.", "")
@@ -248,13 +143,20 @@ def same_domain(base_url: str, candidate_url: str) -> bool:
 def is_valid_article_url(url: str) -> bool:
     if not url:
         return False
+
     lowered = url.lower()
-    if lowered.startswith("javascript:"):
+    blocked_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip")
+    blocked_fragments = ["javascript:", "mailto:", "/tag/", "/eticheta/", "/categorie/", "/category/"]
+
+    if lowered.startswith("javascript:") or lowered.startswith("mailto:"):
         return False
-    if lowered.startswith("mailto:"):
+
+    if any(fragment in lowered for fragment in blocked_fragments):
         return False
-    if "#" in lowered and lowered.endswith("#"):
+
+    if lowered.endswith(blocked_suffixes):
         return False
+
     return True
 
 
@@ -305,112 +207,204 @@ def extract_article_content(html: str) -> tuple[str, str]:
     if og_title and og_title.get("content"):
         title = clean_text(og_title["content"])
 
-    paragraphs = []
+    paragraphs: list[str] = []
     for p in soup.find_all("p"):
         text = clean_text(p.get_text(" ", strip=True))
-        if len(text) >= 30:
+        if len(text) >= 35:
             paragraphs.append(text)
 
-    content = " ".join(paragraphs[:20]).strip()
+    content = " ".join(paragraphs[:30]).strip()
     return title, content
 
 
-def build_incident_uid(source_id: int, article_url: str, title: str) -> str:
-    raw = f"{source_id}|{article_url}|{normalize_text(title)}"
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+def upsert_article(conn, source: SourceItem, parsed: dict) -> int:
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO articles (
+            source_id,
+            title,
+            url,
+            content,
+            published_at,
+            county,
+            city,
+            detected_incident_type,
+            detected_severity,
+            ai_confidence,
+            is_processed
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        ON CONFLICT(url) DO UPDATE SET
+            title = excluded.title,
+            content = excluded.content,
+            published_at = COALESCE(excluded.published_at, articles.published_at),
+            county = COALESCE(excluded.county, articles.county),
+            city = COALESCE(excluded.city, articles.city),
+            detected_incident_type = COALESCE(excluded.detected_incident_type, articles.detected_incident_type),
+            detected_severity = COALESCE(excluded.detected_severity, articles.detected_severity),
+            ai_confidence = excluded.ai_confidence,
+            is_processed = 1
+        """,
+        (
+            source.id,
+            parsed["title"],
+            parsed["url"],
+            parsed["summary"],
+            parsed["published_date"],
+            parsed["county"] or source.county,
+            parsed["city"] or source.city,
+            parsed["incident_type"],
+            parsed["severity_level"],
+            parsed["ai_confidence"],
+        ),
+    )
+
+    cursor.execute("SELECT id FROM articles WHERE url = ?", (parsed["url"],))
+    row = cursor.fetchone()
+    if not row:
+        raise RuntimeError(f"Nu s-a putut salva articolul: {parsed['url']}")
+
+    return row["id"]
 
 
-def incident_exists(incident_uid: str) -> bool:
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            SELECT 1
-            FROM incidents
-            WHERE incident_uid = ?
-            LIMIT 1
-        """, (incident_uid,))
-        row = cursor.fetchone()
-        return row is not None
-    finally:
-        conn.close()
+def get_incident_id_by_uid(conn, incident_uid: str) -> Optional[int]:
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM incidents WHERE incident_uid = ? LIMIT 1", (incident_uid,))
+    row = cursor.fetchone()
+    return row["id"] if row else None
 
 
-def save_incident(
+def save_incident_mention(
+    conn,
+    incident_id: int,
     source: SourceItem,
-    title: str,
-    article_url: str,
-    article_content: str,
-    incident_type: str,
-    severity_level: str,
+    article_id: int,
+    mention_title: str,
+    mention_url: str,
+    published_date: Optional[str],
 ) -> None:
-    incident_uid = build_incident_uid(source.id, article_url, title)
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT OR IGNORE INTO incident_mentions (
+            incident_id,
+            source_id,
+            article_id,
+            mention_title,
+            mention_url,
+            published_date
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            incident_id,
+            source.id,
+            article_id,
+            mention_title,
+            mention_url,
+            published_date,
+        ),
+    )
 
-    if incident_exists(incident_uid):
-        logging.info("EXISTA DEJA | %s | %s", source.name, title)
-        return
 
-    now_iso = datetime.now(timezone.utc).isoformat()
+def save_incident(conn, source: SourceItem, article_id: int, parsed: dict) -> int:
+    incident_id = get_incident_id_by_uid(conn, parsed["incident_uid"])
+    if incident_id:
+        save_incident_mention(
+            conn=conn,
+            incident_id=incident_id,
+            source=source,
+            article_id=article_id,
+            mention_title=parsed["title"],
+            mention_url=parsed["url"],
+            published_date=parsed["published_date"],
+        )
+        return incident_id
 
-    conn = get_connection()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO incidents (
-                incident_uid,
-                incident_type,
-                severity_level,
-                title,
-                summary,
-                event_date,
-                published_date,
-                days_ago,
-                address_text,
-                location_text,
-                city,
-                county,
-                latitude,
-                longitude,
-                geo_confidence,
-                ai_confidence,
-                is_verified,
-                verification_status,
-                source_priority,
-                duplicate_group_id,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
+    county_value = parsed["county"] or source.county
+    city_value = parsed["city"] or source.city
+
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO incidents (
             incident_uid,
             incident_type,
             severity_level,
             title,
-            article_content[:1500] if article_content else title,
+            summary,
+            event_date,
+            published_date,
+            days_ago,
+            address_text,
+            location_text,
+            city,
+            county,
+            latitude,
+            longitude,
+            geo_confidence,
+            ai_confidence,
+            is_verified,
+            verification_status,
+            source_priority,
+            duplicate_group_id,
+            primary_source_id,
+            article_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            parsed["incident_uid"],
+            parsed["incident_type"],
+            parsed["severity_level"],
+            parsed["title"],
+            parsed["summary"],
+            parsed["published_date"],
+            parsed["published_date"],
+            parsed["days_ago"],
             None,
-            now_iso,
-            0,
             None,
-            article_url,
-            source.city,
-            source.county,
+            city_value,
+            county_value,
             None,
             None,
             None,
-            0.82,
-            0,
-            "detected_by_rules",
+            parsed["ai_confidence"],
+            parsed["is_verified"],
+            parsed["verification_status"],
             source.trust_level,
             None,
-            now_iso,
-            now_iso,
-        ))
-        conn.commit()
-        logging.info("SALVAT | %s | %s | %s", source.name, incident_type, title)
-    except sqlite3.IntegrityError as exc:
-        logging.warning("Duplicate/integrity error | %s | %s", title, exc)
-    finally:
-        conn.close()
+            source.id,
+            article_id,
+        ),
+    )
+
+    incident_id = cursor.lastrowid
+    save_incident_mention(
+        conn=conn,
+        incident_id=incident_id,
+        source=source,
+        article_id=article_id,
+        mention_title=parsed["title"],
+        mention_url=parsed["url"],
+        published_date=parsed["published_date"],
+    )
+    return incident_id
+
+
+def should_keep_parsed_result(parsed: dict) -> bool:
+    if not parsed["title"]:
+        return False
+
+    if parsed["incident_type"] == "general":
+        return False
+
+    if parsed["ai_confidence"] < MIN_AI_CONFIDENCE:
+        return False
+
+    return True
 
 
 def process_source(session: requests.Session, source: SourceItem) -> None:
@@ -424,47 +418,74 @@ def process_source(session: requests.Session, source: SourceItem) -> None:
     logging.info("Linkuri candidate extrase: %s", len(candidates))
 
     processed = 0
-    incident_count = 0
+    saved_articles = 0
+    saved_incidents = 0
 
-    for link_text, article_url in candidates:
-        if processed >= MAX_ARTICLES_TO_PROCESS:
-            break
+    conn = get_connection()
+    try:
+        for link_text, article_url in candidates:
+            if processed >= MAX_ARTICLES_TO_PROCESS:
+                break
 
-        article_html = fetch_page(session, article_url)
-        if not article_html:
-            continue
+            article_html = fetch_page(session, article_url)
+            if not article_html:
+                continue
 
-        page_title, article_content = extract_article_content(article_html)
-        final_title = page_title if len(page_title) >= MIN_TITLE_LEN else link_text
+            page_title, article_content = extract_article_content(article_html)
+            final_title = page_title if len(page_title) >= MIN_TITLE_LEN else link_text
 
-        combined_text = f"{final_title} {article_content}".strip()
+            combined_text = f"{final_title} {article_content}".strip()
 
-        if len(combined_text) < MIN_CONTENT_LEN:
-            continue
-        if is_noise(combined_text):
-            continue
+            if len(combined_text) < MIN_CONTENT_LEN:
+                continue
+            if is_noise(combined_text):
+                continue
 
-        incident_type, severity = classify_incident(combined_text)
-        processed += 1
+            parsed = build_parser_result(
+                title=final_title,
+                content=article_content,
+                url=article_url,
+                source_name=source.name,
+            )
 
-        if not incident_type or not severity:
-            continue
+            processed += 1
 
-        incident_count += 1
-        logging.info("INCIDENT [%s / %s] %s | %s", incident_type, severity, source.name, final_title)
+            if not should_keep_parsed_result(parsed):
+                continue
 
-        save_incident(
-            source=source,
-            title=final_title,
-            article_url=article_url,
-            article_content=article_content,
-            incident_type=incident_type,
-            severity_level=severity,
-        )
+            if not parsed["county"] and source.county:
+                parsed["county"] = source.county
+            if not parsed["city"] and source.city:
+                parsed["city"] = source.city
+
+            article_id = upsert_article(conn, source, parsed)
+            saved_articles += 1
+
+            save_incident(conn, source, article_id, parsed)
+            saved_incidents += 1
+
+            conn.commit()
+
+            logging.info(
+                "SALVAT | %s | %s | %s | conf=%.3f",
+                source.name,
+                parsed["incident_type"],
+                parsed["title"],
+                parsed["ai_confidence"],
+            )
+
+    except Exception as exc:
+        conn.rollback()
+        logging.exception("Eroare la procesarea sursei %s: %s", source.name, exc)
+    finally:
+        conn.close()
 
     logging.info(
-        "Sursa %s | articole procesate: %s | incidente detectate: %s",
-        source.name, processed, incident_count
+        "Sursa %s | articole procesate: %s | articole salvate: %s | incidente salvate: %s",
+        source.name,
+        processed,
+        saved_articles,
+        saved_incidents,
     )
 
 

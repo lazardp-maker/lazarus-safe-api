@@ -3,6 +3,7 @@ import unicodedata
 from datetime import datetime, timezone
 from typing import Optional
 
+
 ROMANIAN_MONTHS = {
     "ianuarie": 1,
     "februarie": 2,
@@ -25,76 +26,85 @@ COUNTIES = [
     "gorj", "harghita", "hunedoara", "ialomita", "iasi", "ilfov", "maramures",
     "mehedinti", "mures", "neamt", "olt", "prahova", "satu mare", "salaj",
     "sibiu", "suceava", "teleorman", "timis", "tulcea", "vaslui", "valcea",
-    "vrancea"
+    "vrancea",
 ]
 
 CITY_HINTS = [
     "pitesti", "mioveni", "curtea de arges", "campulung", "costesti",
-    "bucuresti", "cluj napoca", "iasi", "timisoara", "constanta", "brasov",
-    "ploiesti", "craiova", "oradea", "arad", "baia mare", "sibiu", "galati",
-    "buzau", "satu mare", "targu mures", "focsani", "slatina", "alexandria",
-    "vaslui", "botosani", "deva", "resita", "targoviste", "giurgiu"
+    "bucuresti", "cluj napoca", "cluj-napoca", "iasi", "timisoara", "constanta",
+    "brasov", "ploiesti", "craiova", "oradea", "arad", "baia mare", "sibiu",
+    "galati", "buzau", "satu mare", "targu mures", "focsani", "slatina",
+    "alexandria", "vaslui", "botosani", "deva", "resita", "targoviste",
+    "giurgiu", "piatra neamt", "ramnicu valcea", "alba iulia", "zalau",
+    "drobeta turnu severin", "miercurea ciuc", "slobozia", "tulcea",
+    "sfantu gheorghe", "voluntari", "suceava", "bacau",
 ]
 
 INCIDENT_KEYWORDS = {
     "homicide": [
         "omor", "omucidere", "crima", "crimă", "femicid", "ucis", "ucisa",
         "ucisă", "a fost omorat", "a fost omorât", "si-a ucis", "și-a ucis",
-        "lovit mortal", "mort in urma agresiunii", "mort în urma agresiunii"
+        "lovit mortal", "mort in urma agresiunii", "mort în urma agresiunii",
+        "asasinat",
     ],
     "sexual_violence": [
         "viol", "violat", "violata", "violată", "agresiune sexuala",
         "agresiune sexuală", "abuz sexual", "hartuire sexuala", "hărțuire sexuală",
-        "act sexual", "corupere sexuala", "corupere sexuală"
+        "act sexual", "corupere sexuala", "corupere sexuală", "violenta sexuala",
+        "violență sexuală",
     ],
     "robbery": [
-        "talharie", "tâlhărie", "jaf", "jefuit", "jefuita", "jefuita",
-        "atacat pentru a-i fura", "deposedat prin violenta", "deposedat prin violență"
+        "talharie", "tâlhărie", "jaf", "jefuit", "deposedat prin violenta",
+        "deposedat prin violență",
     ],
     "theft": [
         "furt", "furat", "furata", "furată", "furturi", "hot", "hoț", "hoti",
         "hoți", "spargere", "a sustras", "a furat", "bunuri sustrase",
         "portofel furat", "telefon furat", "furt din buzunare", "furt din locuinta",
-        "furt din locuința", "furt calificat"
+        "furt din locuința", "furt calificat", "efractie", "efracție",
     ],
     "violence": [
         "agresiune", "agresiuni", "bataie", "bătaie", "batut", "bătut",
         "batuta", "bătută", "violenta", "violență", "lovire", "ranit", "rănit",
-        "conflict violent", "scandal soldat cu violente", "scandal soldat cu violențe"
+        "conflict violent", "scandal soldat cu violente", "scandal soldat cu violențe",
+        "injunghiat", "înjunghiat", "injunghiere", "înjunghiere",
     ],
     "traffic": [
         "accident rutier", "accident de circulatie", "accident de circulație",
-        "coliziune", "a intrat cu masina", "a intrat cu mașina", "rasturnat",
-        "răsturnat", "impact intre", "impact între", "autoturism", "masina a lovit",
-        "mașina a lovit", "pieton accidentat", "tamponare", "carambol"
+        "coliziune", "rasturnat", "răsturnat", "impact intre", "impact între",
+        "autoturism", "masina a lovit", "mașina a lovit", "pieton accidentat",
+        "tamponare", "carambol",
     ],
     "emergency": [
         "incendiu", "explozie", "interventia isu", "intervenția isu", "smurd",
         "situatie de urgenta", "situație de urgență", "cutremur", "inundatie",
         "inundație", "alunecare de teren", "copac cazut", "copac căzut",
-        "persoana blocata", "persoană blocată"
+        "persoana blocata", "persoană blocată",
     ],
     "public_order": [
         "tulburarea ordinii publice", "tulburarea linistii publice",
         "tulburarea liniștii publice", "ordine publica", "ordine publică",
-        "scandal public", "huliganism", "grup violent", "deranjarea ordinii"
+        "scandal public", "huliganism", "grup violent", "deranjarea ordinii",
     ],
 }
 
 SEVERITY_KEYWORDS = {
-    "high": [
+    "critical": [
         "decedat", "decedata", "decedată", "mort", "morta", "moarta", "moartă",
-        "critic", "grav", "grave", "multiple victime", "cu arma", "cu armă",
-        "incendiu puternic", "violenta extrema", "violență extremă",
-        "prejudiciu de peste", "retinut pentru omor", "reținut pentru omor"
+        "multiple victime", "in stare critica", "în stare critică",
+    ],
+    "high": [
+        "critic", "grav", "grave", "cu arma", "cu armă", "incendiu puternic",
+        "violenta extrema", "violență extremă", "prejudiciu de peste",
+        "retinut pentru omor", "reținut pentru omor",
     ],
     "medium": [
         "ranit", "rănit", "retinut", "reținut", "arestat", "perchezitii",
-        "percheziții", "lovit", "internat", "prejudiciu", "dosar penal"
+        "percheziții", "lovit", "internat", "prejudiciu", "dosar penal",
     ],
     "low": [
         "cercetat", "verificari", "verificări", "sanctionat", "sancționat",
-        "minor", "tentativa", "tentativă"
+        "minor", "tentativa", "tentativă",
     ],
 }
 
@@ -102,18 +112,33 @@ SEVERITY_KEYWORDS = {
 def normalize_text(value: Optional[str]) -> str:
     if not value:
         return ""
+
     value = unicodedata.normalize("NFKD", value)
     value = "".join(ch for ch in value if not unicodedata.combining(ch))
     value = value.lower().strip()
     value = value.replace("ş", "s").replace("ș", "s")
     value = value.replace("ţ", "t").replace("ț", "t")
     value = re.sub(r"\s+", " ", value)
-    return value
+
+    aliases = {
+        "cluj napoca": "cluj-napoca",
+        "tirgu mures": "targu mures",
+        "bucurești": "bucuresti",
+        "sector 1": "bucuresti",
+        "sector 2": "bucuresti",
+        "sector 3": "bucuresti",
+        "sector 4": "bucuresti",
+        "sector 5": "bucuresti",
+        "sector 6": "bucuresti",
+    }
+
+    return aliases.get(value, value)
 
 
 def clean_html(raw_html: Optional[str]) -> str:
     if not raw_html:
         return ""
+
     text = re.sub(r"<script.*?>.*?</script>", " ", raw_html, flags=re.I | re.S)
     text = re.sub(r"<style.*?>.*?</style>", " ", text, flags=re.I | re.S)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
@@ -134,13 +159,6 @@ def compact_summary(text: str, max_len: int = 320) -> str:
     return f"{cut}..."
 
 
-def match_first_keyword(text: str, keywords: list[str]) -> Optional[str]:
-    for kw in keywords:
-        if kw in text:
-            return kw
-    return None
-
-
 def classify_incident_type(title: str, content: str) -> tuple[str, float, Optional[str]]:
     combined = normalize_text(f"{title} {content}")
 
@@ -151,6 +169,7 @@ def classify_incident_type(title: str, content: str) -> tuple[str, float, Option
     for incident_type, keywords in INCIDENT_KEYWORDS.items():
         hits = 0
         first_hit = None
+
         for kw in keywords:
             if kw in combined:
                 hits += 1
@@ -158,14 +177,14 @@ def classify_incident_type(title: str, content: str) -> tuple[str, float, Option
                     first_hit = kw
 
         if hits > 0:
-            score = min(0.55 + hits * 0.1, 0.95)
+            score = min(0.55 + hits * 0.1, 0.96)
             if score > best_score:
                 best_score = score
                 best_type = incident_type
                 matched_keyword = first_hit
 
     if best_type == "general":
-        return "general", 0.35, None
+        return "general", 0.30, None
 
     return best_type, best_score, matched_keyword
 
@@ -174,33 +193,38 @@ def classify_severity(title: str, content: str, incident_type: str) -> tuple[str
     combined = normalize_text(f"{title} {content}")
 
     if incident_type in {"homicide", "sexual_violence"}:
-        return "high", 0.92
+        return "critical", 0.93
+
+    for kw in SEVERITY_KEYWORDS["critical"]:
+        if kw in combined:
+            return "critical", 0.92
 
     for kw in SEVERITY_KEYWORDS["high"]:
         if kw in combined:
-            return "high", 0.9
+            return "high", 0.86
 
     for kw in SEVERITY_KEYWORDS["medium"]:
         if kw in combined:
-            return "medium", 0.75
+            return "medium", 0.74
 
     for kw in SEVERITY_KEYWORDS["low"]:
         if kw in combined:
-            return "low", 0.65
+            return "low", 0.64
 
     if incident_type in {"robbery", "violence", "emergency"}:
-        return "medium", 0.7
+        return "high", 0.72
     if incident_type in {"theft", "public_order", "traffic"}:
-        return "low", 0.6
+        return "medium", 0.66
 
-    return "low", 0.5
+    return "low", 0.50
 
 
 def detect_county(text: str) -> Optional[str]:
     normalized = normalize_text(text)
 
     for county in COUNTIES:
-        if county in normalized:
+        pattern = rf"\b{re.escape(county)}\b"
+        if re.search(pattern, normalized):
             return county
 
     patterns = [
@@ -225,25 +249,29 @@ def detect_city(text: str) -> Optional[str]:
     normalized = normalize_text(text)
 
     for city in CITY_HINTS:
-        if city in normalized:
-            return city
+        pattern = rf"\b{re.escape(city)}\b"
+        if re.search(pattern, normalized):
+            return normalize_text(city)
 
     patterns = [
-        r"municipiul\s+([a-z ]+)",
-        r"orasul\s+([a-z ]+)",
-        r"orașul\s+([a-z ]+)",
-        r"in\s+([a-z ]+)",
-        r"din\s+([a-z ]+)",
-        r"la\s+([a-z ]+)",
+        r"municipiul\s+([a-z\- ]+)",
+        r"orasul\s+([a-z\- ]+)",
+        r"orașul\s+([a-z\- ]+)",
+        r"comuna\s+([a-z\- ]+)",
+        r"localitatea\s+([a-z\- ]+)",
     ]
 
     for pattern in patterns:
         match = re.search(pattern, normalized)
         if match:
             candidate = match.group(1).strip()
-            candidate = re.sub(r"\b(judet|judetul|jud\.|strada|bulevardul|bd\.|soseaua)\b.*", "", candidate).strip()
-            if 2 <= len(candidate) <= 40:
-                return candidate
+            candidate = re.sub(
+                r"\b(judet|judetul|jud\.|strada|bulevardul|bd\.|soseaua|șoseaua)\b.*",
+                "",
+                candidate,
+            ).strip()
+            if 2 <= len(candidate) <= 50:
+                return normalize_text(candidate)
 
     return None
 
@@ -263,7 +291,7 @@ def extract_published_date(text: str) -> Optional[str]:
 
     text_month_match = re.search(
         r"\b(\d{1,2})\s+(ianuarie|februarie|martie|aprilie|mai|iunie|iulie|august|septembrie|octombrie|noiembrie|decembrie)\s+(20\d{2})\b",
-        normalized
+        normalized,
     )
     if text_month_match:
         day, month_name, year = text_month_match.groups()
@@ -276,6 +304,7 @@ def extract_published_date(text: str) -> Optional[str]:
 def compute_days_ago(published_date: Optional[str]) -> Optional[int]:
     if not published_date:
         return None
+
     try:
         pub = datetime.strptime(published_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
@@ -290,7 +319,7 @@ def build_incident_uid(
     county: Optional[str],
     city: Optional[str],
     incident_type: str,
-    published_date: Optional[str]
+    published_date: Optional[str],
 ) -> str:
     source_str = " | ".join([
         normalize_text(title)[:120],
@@ -332,6 +361,9 @@ def build_parser_result(
         published_date=published_date,
     )
 
+    source_name_n = normalize_text(source_name)
+    is_official_source = any(token in source_name_n for token in ["politia", "isu", "dsu", "igsu", "mai", "ipj"])
+
     return {
         "incident_uid": incident_uid,
         "title": plain_title,
@@ -346,7 +378,7 @@ def build_parser_result(
         "city": city,
         "published_date": published_date,
         "days_ago": days_ago,
-        "verification_status": "auto_parsed",
-        "is_verified": 0,
-        "source_priority": 5 if "politia" in normalize_text(source_name) or "isu" in normalize_text(source_name) or "dsu" in normalize_text(source_name) else 3,
+        "verification_status": "verified" if is_official_source else "auto_parsed",
+        "is_verified": 1 if is_official_source else 0,
+        "source_priority": 5 if is_official_source else 3,
     }
