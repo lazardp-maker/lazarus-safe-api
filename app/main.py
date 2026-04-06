@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import logging
+import os
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 import requests
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-import scripts.seed_area_profiles as seed_area_profiles_script
-import scripts.seed_sources as seed_sources_script
 from app.collectors.collector_real import main as run_collector
 from app.db import (
     get_connection,
@@ -25,11 +25,25 @@ from app.risk_engine import (
 )
 from app.schemas import AnalyzeRequest, AnalyzeResponse
 
+APP_NAME = "Lazarus Safe API"
+APP_VERSION = os.getenv("APP_VERSION", "3.3.0")
+APP_ENV = os.getenv("APP_ENV", "development")
+GEOCODER_TIMEOUT_SECONDS = int(os.getenv("GEOCODER_TIMEOUT_SECONDS", "10"))
+
+logger = logging.getLogger(APP_NAME)
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+
 
 app = FastAPI(
-    title="Lazarus Safe API",
-    version="3.2.2",
-    description="API pentru evaluarea riscului de securitate fizică pe baza locației, cu suport pentru colectare de date publice.",
+    title=APP_NAME,
+    version=APP_VERSION,
+    description=(
+        "API pentru evaluarea riscului de securitate fizică pe baza locației, "
+        "cu suport pentru analiză geospațială și colectare de date publice."
+    ),
 )
 
 app.add_middleware(
@@ -43,28 +57,36 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup_event() -> None:
-    print("[startup] Initializing database...")
-    initialize_database()
-    validate_critical_tables()
+    """
+    Startup minimalist și sigur:
+    - inițializează baza de date
+    - validează tabelele critice
+    - loghează informații utile
+    NU rulează scraping, seed sau alte joburi grele.
+    """
+    logger.info("startup.begin env=%s version=%s", APP_ENV, APP_VERSION)
+
+    try:
+        initialize_database()
+        validate_critical_tables()
+        logger.info("database.initialized path=%s", get_db_path())
+    except Exception as exc:
+        logger.exception("startup.database_failed error=%s", exc)
+        raise
 
     try:
         with get_connection() as conn:
-            print(f"[startup] DB path: {get_db_path()}")
-            print(f"[startup] Tables: {list_tables(conn)}")
+            tables = list_tables(conn)
+            logger.info("database.tables_found count=%s tables=%s", len(tables), tables)
     except Exception as exc:
-        print(f"[startup] DB inspection error: {exc}")
+        logger.exception("startup.db_inspection_failed error=%s", exc)
 
-    try:
-        seed_sources_script.main()
-        print("[startup] sources seeded")
-    except Exception as exc:
-        print(f"[startup] seed_sources error: {exc}")
+    logger.info("startup.complete")
 
-    try:
-        seed_area_profiles_script.main()
-        print("[startup] area profiles seeded")
-    except Exception as exc:
-        print(f"[startup] seed_area_profiles error: {exc}")
+
+@app.on_event("shutdown")
+def shutdown_event() -> None:
+    logger.info("shutdown.complete")
 
 
 def normalize_text(value: Optional[str]) -> Optional[str]:
@@ -127,7 +149,7 @@ def canonicalize_place(value: Optional[str]) -> Optional[str]:
 def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optional[str]]:
     url = "https://nominatim.openstreetmap.org/reverse"
     headers = {
-        "User-Agent": "LazarusSafeApp/3.2.2 (contact: lazardp@gmail.com)",
+        "User-Agent": f"LazarusSafeApp/{APP_VERSION} (contact: lazardp@gmail.com)",
         "Accept": "application/json",
     }
     params = {
@@ -139,7 +161,12 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
     }
 
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=GEOCODER_TIMEOUT_SECONDS,
+        )
         response.raise_for_status()
 
         data = response.json()
@@ -166,18 +193,28 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
         if county == "bucuresti":
             city = "bucuresti"
 
-        print(
-            f"[geocode] lat={lat} lng={lng} "
-            f"raw_county={raw_county} raw_city={raw_city} "
-            f"county={county} city={city}"
+        logger.info(
+            "reverse_geocode.success lat=%s lng=%s raw_county=%s raw_city=%s county=%s city=%s",
+            lat,
+            lng,
+            raw_county,
+            raw_city,
+            county,
+            city,
         )
 
         if county:
             return county, city
 
     except Exception as exc:
-        print(f"[geocode] error lat={lat} lng={lng}: {exc}")
+        logger.warning(
+            "reverse_geocode.failed lat=%s lng=%s error=%s",
+            lat,
+            lng,
+            exc,
+        )
 
+    # fallback-uri minimale
     if 44.3 <= lat <= 44.6 and 25.9 <= lng <= 26.3:
         return "bucuresti", "bucuresti"
 
@@ -187,7 +224,7 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
     return None, None
 
 
-def empty_incidents_summary() -> dict:
+def empty_incidents_summary() -> dict[str, int]:
     return {
         "homicide": 0,
         "sexual_violence": 0,
@@ -201,7 +238,7 @@ def empty_incidents_summary() -> dict:
     }
 
 
-def incidents_summary_to_dict(value) -> dict:
+def incidents_summary_to_dict(value: Any) -> dict[str, int]:
     if value is None:
         return empty_incidents_summary()
 
@@ -250,7 +287,12 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
         )
         sources_used = get_sources_used(county, city)
     except Exception as exc:
-        print(f"[risk_engine] county={county} city={city} error={exc}")
+        logger.exception(
+            "risk_engine.failed county=%s city=%s error=%s",
+            county,
+            city,
+            exc,
+        )
         return AnalyzeResponse(
             level="UNKNOWN",
             message="Locația a fost identificată, dar analiza de risc a eșuat.",
@@ -269,6 +311,12 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
         )
 
     if not isinstance(result, dict):
+        logger.warning(
+            "risk_engine.invalid_result_type county=%s city=%s type=%s",
+            county,
+            city,
+            type(result).__name__,
+        )
         return AnalyzeResponse(
             level="UNKNOWN",
             message="Analiza nu a returnat un rezultat valid.",
@@ -290,19 +338,288 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
         message=result.get("message", "Analiza nu a putut fi completată."),
         county=county,
         city=city,
-        incidents_summary=result.get("incidents_summary", empty_incidents_summary()),
+        incidents_summary=incidents_summary_to_dict(
+            result.get("incidents_summary", empty_incidents_summary())
+        ),
         sources_used=sources_used if isinstance(sources_used, list) else [],
-        confidence=result.get("confidence"),
+        confidence=result.get("confidence", 0.0),
         analyzed_at=analyzed_at,
         debug=result.get("meta"),
     )
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    """
+    Verifică dacă API-ul este pornit și DB răspunde.
+    """
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) AS total FROM sources")
+        sources_total = cursor.fetchone()["total"]
+
+        cursor.execute("SELECT COUNT(*) AS total FROM area_risk_profiles")
+        profiles_total = cursor.fetchone()["total"]
+
+        cursor.execute("SELECT COUNT(*) AS total FROM incidents")
+        incidents_total = cursor.fetchone()["total"]
+
+        cursor.execute("SELECT COUNT(*) AS total FROM articles")
+        articles_total = cursor.fetchone()["total"]
+
+    return {
+        "status": "ok",
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "environment": APP_ENV,
+        "db_path": get_db_path(),
+        "stats": {
+            "sources": sources_total,
+            "area_risk_profiles": profiles_total,
+            "incidents": incidents_total,
+            "articles": articles_total,
+        },
+    }
+
+
+@app.get("/ready")
+def ready() -> dict[str, Any]:
+    """
+    Verifică readiness-ul minim pentru runtime.
+    """
+    try:
+        with get_connection() as conn:
+            tables = list_tables(conn)
+
+        required_tables = {
+            "sources",
+            "area_risk_profiles",
+            "incidents",
+            "articles",
+        }
+        missing_tables = sorted(required_tables - set(tables))
+
+        return {
+            "status": "ok" if not missing_tables else "degraded",
+            "service": APP_NAME,
+            "version": APP_VERSION,
+            "missing_tables": missing_tables,
+        }
+    except Exception as exc:
+        logger.exception("ready.failed error=%s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Readiness check failed: {exc}",
+        )
+
+
+@app.get("/debug/db")
+def debug_db() -> dict[str, Any]:
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        tables = list_tables(conn)
+
+        columns: dict[str, list[str]] = {}
+        for table_name in tables:
+            try:
+                cursor.execute(f"PRAGMA table_info({table_name})")
+                columns[table_name] = [row["name"] for row in cursor.fetchall()]
+            except Exception:
+                columns[table_name] = []
+
+        return {
+            "db_path": get_db_path(),
+            "tables": tables,
+            "columns": columns,
+        }
+
+
+@app.get("/admin/db-summary")
+def admin_db_summary() -> dict[str, Any]:
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) AS total FROM sources")
+        sources_total = cursor.fetchone()["total"]
+
+        cursor.execute("SELECT COUNT(*) AS total FROM articles")
+        articles_total = cursor.fetchone()["total"]
+
+        cursor.execute("SELECT COUNT(*) AS total FROM incidents")
+        incidents_total = cursor.fetchone()["total"]
+
+        cursor.execute("SELECT COUNT(*) AS total FROM incident_mentions")
+        mentions_total = cursor.fetchone()["total"]
+
+        cursor.execute("SELECT COUNT(*) AS total FROM area_risk_profiles")
+        profiles_total = cursor.fetchone()["total"]
+
+        cursor.execute(
+            """
+            SELECT verification_status, COUNT(*) AS total
+            FROM incidents
+            GROUP BY verification_status
+            ORDER BY total DESC
+            """
+        )
+        by_verification = [
+            {"verification_status": row["verification_status"], "total": row["total"]}
+            for row in cursor.fetchall()
+        ]
+
+        cursor.execute(
+            """
+            SELECT incident_type, COUNT(*) AS total
+            FROM incidents
+            GROUP BY incident_type
+            ORDER BY total DESC
+            """
+        )
+        by_type = [
+            {"incident_type": row["incident_type"], "total": row["total"]}
+            for row in cursor.fetchall()
+        ]
+
+    return {
+        "db_path": get_db_path(),
+        "totals": {
+            "sources": sources_total,
+            "articles": articles_total,
+            "incidents": incidents_total,
+            "incident_mentions": mentions_total,
+            "area_risk_profiles": profiles_total,
+        },
+        "incidents_by_verification_status": by_verification,
+        "incidents_by_type": by_type,
+    }
+
+
+@app.get("/admin/recent-incidents")
+def admin_recent_incidents(
+    limit: int = Query(default=20, ge=1, le=100),
+    county: Optional[str] = Query(default=None),
+    city: Optional[str] = Query(default=None),
+) -> dict[str, Any]:
+    county_n = canonicalize_place(county) if county else None
+    city_n = canonicalize_place(city) if city else None
+
+    where_parts = ["1=1"]
+    params: list[object] = []
+
+    if county_n:
+        where_parts.append("county = ?")
+        params.append(county_n)
+
+    if city_n:
+        where_parts.append("city = ?")
+        params.append(city_n)
+
+    where_sql = " AND ".join(where_parts)
+
+    query = f"""
+        SELECT
+            id,
+            incident_uid,
+            incident_type,
+            severity_level,
+            title,
+            summary,
+            event_date,
+            published_date,
+            days_ago,
+            city,
+            county,
+            ai_confidence,
+            is_verified,
+            verification_status,
+            source_priority,
+            created_at
+        FROM incidents
+        WHERE {where_sql}
+        ORDER BY
+            COALESCE(date(event_date), date(published_date), date(created_at)) DESC,
+            id DESC
+        LIMIT ?
+    """
+    params.append(limit)
+
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+    incidents = []
+    for row in rows:
+        incidents.append(
+            {
+                "id": row["id"],
+                "incident_uid": row["incident_uid"],
+                "incident_type": row["incident_type"],
+                "severity_level": row["severity_level"],
+                "title": row["title"],
+                "summary": row["summary"],
+                "event_date": row["event_date"],
+                "published_date": row["published_date"],
+                "days_ago": row["days_ago"],
+                "city": row["city"],
+                "county": row["county"],
+                "ai_confidence": row["ai_confidence"],
+                "is_verified": row["is_verified"],
+                "verification_status": row["verification_status"],
+                "source_priority": row["source_priority"],
+                "created_at": row["created_at"],
+            }
+        )
+
+    return {
+        "count": len(incidents),
+        "filters": {
+            "county": county_n,
+            "city": city_n,
+            "limit": limit,
+        },
+        "items": incidents,
+    }
+
+
+@app.post("/admin/run-collector")
+def admin_run_collector() -> dict[str, str]:
+    """
+    Rulează collectorul manual, la cerere.
+    Nu rulează automat la startup.
+    """
+    try:
+        logger.info("collector.manual_run.begin")
+        run_collector()
+        logger.info("collector.manual_run.complete")
+        return {
+            "status": "ok",
+            "message": "Collectorul a rulat cu succes.",
+        }
+    except Exception as exc:
+        logger.exception("collector.manual_run.failed error=%s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Eroare la rularea collectorului: {exc}",
+        )
+
+
+@app.post("/analyze", response_model=AnalyzeResponse)
+def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
+    return build_analysis_response(payload)
+
+
+@app.post("/location-risk", response_model=AnalyzeResponse)
+def location_risk(payload: AnalyzeRequest) -> AnalyzeResponse:
+    return build_analysis_response(payload)
 
 
 @app.get("/risk")
 def get_risk(
     lat: float = Query(..., description="Latitudine"),
     lng: float = Query(..., description="Longitudine"),
-) -> dict:
+) -> dict[str, Any]:
     payload = AnalyzeRequest(lat=lat, lng=lng)
     result = build_analysis_response(payload)
 
@@ -335,13 +652,28 @@ def heatmap(
     lng: float = Query(..., description="Longitudine centru"),
     radius_m: int = Query(default=10000, ge=200, le=20000, description="Rază în metri"),
     lookback_days: int = Query(default=365, ge=1, le=365, description="Fereastră analiză"),
-) -> dict:
-    points = get_heatmap_points(
-        center_lat=lat,
-        center_lng=lng,
-        radius_m=radius_m,
-        lookback_days=lookback_days,
-    )
+) -> dict[str, Any]:
+    try:
+        points = get_heatmap_points(
+            center_lat=lat,
+            center_lng=lng,
+            radius_m=radius_m,
+            lookback_days=lookback_days,
+        )
+    except Exception as exc:
+        logger.exception(
+            "heatmap.failed lat=%s lng=%s radius_m=%s lookback_days=%s error=%s",
+            lat,
+            lng,
+            radius_m,
+            lookback_days,
+            exc,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Eroare la generarea heatmap: {exc}",
+        )
+
     return {
         "count": len(points),
         "geo_points_found": len(points),
@@ -884,227 +1216,3 @@ def home() -> str:
     </body>
     </html>
     """
-
-
-@app.get("/debug/db")
-def debug_db() -> dict:
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        tables = list_tables(conn)
-
-        columns = {}
-        for table_name in tables:
-            try:
-                cursor.execute(f"PRAGMA table_info({table_name})")
-                columns[table_name] = [row["name"] for row in cursor.fetchall()]
-            except Exception:
-                columns[table_name] = []
-
-        return {
-            "db_path": get_db_path(),
-            "tables": tables,
-            "columns": columns,
-        }
-
-
-@app.get("/health")
-def health() -> dict:
-    with get_connection() as conn:
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT COUNT(*) AS total FROM sources")
-        sources_total = cursor.fetchone()["total"]
-
-        cursor.execute("SELECT COUNT(*) AS total FROM area_risk_profiles")
-        profiles_total = cursor.fetchone()["total"]
-
-        cursor.execute("SELECT COUNT(*) AS total FROM incidents")
-        incidents_total = cursor.fetchone()["total"]
-
-        cursor.execute("SELECT COUNT(*) AS total FROM articles")
-        articles_total = cursor.fetchone()["total"]
-
-    return {
-        "status": "ok",
-        "service": "Lazarus Safe API",
-        "db_path": get_db_path(),
-        "stats": {
-            "sources": sources_total,
-            "area_risk_profiles": profiles_total,
-            "incidents": incidents_total,
-            "articles": articles_total,
-        },
-    }
-
-
-@app.get("/admin/db-summary")
-def admin_db_summary() -> dict:
-    with get_connection() as conn:
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT COUNT(*) AS total FROM sources")
-        sources_total = cursor.fetchone()["total"]
-
-        cursor.execute("SELECT COUNT(*) AS total FROM articles")
-        articles_total = cursor.fetchone()["total"]
-
-        cursor.execute("SELECT COUNT(*) AS total FROM incidents")
-        incidents_total = cursor.fetchone()["total"]
-
-        cursor.execute("SELECT COUNT(*) AS total FROM incident_mentions")
-        mentions_total = cursor.fetchone()["total"]
-
-        cursor.execute("SELECT COUNT(*) AS total FROM area_risk_profiles")
-        profiles_total = cursor.fetchone()["total"]
-
-        cursor.execute(
-            '''
-            SELECT verification_status, COUNT(*) AS total
-            FROM incidents
-            GROUP BY verification_status
-            ORDER BY total DESC
-            '''
-        )
-        by_verification = [
-            {"verification_status": row["verification_status"], "total": row["total"]}
-            for row in cursor.fetchall()
-        ]
-
-        cursor.execute(
-            '''
-            SELECT incident_type, COUNT(*) AS total
-            FROM incidents
-            GROUP BY incident_type
-            ORDER BY total DESC
-            '''
-        )
-        by_type = [
-            {"incident_type": row["incident_type"], "total": row["total"]}
-            for row in cursor.fetchall()
-        ]
-
-    return {
-        "db_path": get_db_path(),
-        "totals": {
-            "sources": sources_total,
-            "articles": articles_total,
-            "incidents": incidents_total,
-            "incident_mentions": mentions_total,
-            "area_risk_profiles": profiles_total,
-        },
-        "incidents_by_verification_status": by_verification,
-        "incidents_by_type": by_type,
-    }
-
-
-@app.get("/admin/recent-incidents")
-def admin_recent_incidents(
-    limit: int = Query(default=20, ge=1, le=100),
-    county: Optional[str] = Query(default=None),
-    city: Optional[str] = Query(default=None),
-) -> dict:
-    county_n = canonicalize_place(county) if county else None
-    city_n = canonicalize_place(city) if city else None
-
-    where_parts = ["1=1"]
-    params: list[object] = []
-
-    if county_n:
-        where_parts.append("county = ?")
-        params.append(county_n)
-
-    if city_n:
-        where_parts.append("city = ?")
-        params.append(city_n)
-
-    where_sql = " AND ".join(where_parts)
-
-    query = f"""
-        SELECT
-            id,
-            incident_uid,
-            incident_type,
-            severity_level,
-            title,
-            summary,
-            event_date,
-            published_date,
-            days_ago,
-            city,
-            county,
-            ai_confidence,
-            is_verified,
-            verification_status,
-            source_priority,
-            created_at
-        FROM incidents
-        WHERE {where_sql}
-        ORDER BY
-            COALESCE(date(event_date), date(published_date), date(created_at)) DESC,
-            id DESC
-        LIMIT ?
-    """
-    params.append(limit)
-
-    with get_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
-
-    incidents = []
-    for row in rows:
-        incidents.append(
-            {
-                "id": row["id"],
-                "incident_uid": row["incident_uid"],
-                "incident_type": row["incident_type"],
-                "severity_level": row["severity_level"],
-                "title": row["title"],
-                "summary": row["summary"],
-                "event_date": row["event_date"],
-                "published_date": row["published_date"],
-                "days_ago": row["days_ago"],
-                "city": row["city"],
-                "county": row["county"],
-                "ai_confidence": row["ai_confidence"],
-                "is_verified": row["is_verified"],
-                "verification_status": row["verification_status"],
-                "source_priority": row["source_priority"],
-                "created_at": row["created_at"],
-            }
-        )
-
-    return {
-        "count": len(incidents),
-        "filters": {
-            "county": county_n,
-            "city": city_n,
-            "limit": limit,
-        },
-        "items": incidents,
-    }
-
-
-@app.post("/admin/run-collector")
-def admin_run_collector() -> dict:
-    try:
-        run_collector()
-        return {
-            "status": "ok",
-            "message": "Collectorul a rulat cu succes.",
-        }
-    except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Eroare la rularea collectorului: {exc}",
-        )
-
-
-@app.post("/analyze", response_model=AnalyzeResponse)
-def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
-    return build_analysis_response(payload)
-
-
-@app.post("/location-risk", response_model=AnalyzeResponse)
-def location_risk(payload: AnalyzeRequest) -> AnalyzeResponse:
-    return build_analysis_response(payload)
