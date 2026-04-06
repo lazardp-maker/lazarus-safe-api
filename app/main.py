@@ -10,7 +10,6 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-from app.collectors.collector_real import main as run_collector
 from app.db import (
     get_connection,
     get_db_path,
@@ -26,7 +25,7 @@ from app.risk_engine import (
 from app.schemas import AnalyzeRequest, AnalyzeResponse
 
 APP_NAME = "Lazarus Safe API"
-APP_VERSION = os.getenv("APP_VERSION", "3.3.0")
+APP_VERSION = os.getenv("APP_VERSION", "3.3.1")
 APP_ENV = os.getenv("APP_ENV", "development")
 GEOCODER_TIMEOUT_SECONDS = int(os.getenv("GEOCODER_TIMEOUT_SECONDS", "10"))
 
@@ -35,7 +34,6 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-
 
 app = FastAPI(
     title=APP_NAME,
@@ -214,7 +212,6 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
             exc,
         )
 
-    # fallback-uri minimale
     if 44.3 <= lat <= 44.6 and 25.9 <= lng <= 26.3:
         return "bucuresti", "bucuresti"
 
@@ -350,9 +347,6 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    """
-    Verifică dacă API-ul este pornit și DB răspunde.
-    """
     with get_connection() as conn:
         cursor = conn.cursor()
 
@@ -385,9 +379,6 @@ def health() -> dict[str, Any]:
 
 @app.get("/ready")
 def ready() -> dict[str, Any]:
-    """
-    Verifică readiness-ul minim pentru runtime.
-    """
     try:
         with get_connection() as conn:
             tables = list_tables(conn)
@@ -587,10 +578,12 @@ def admin_recent_incidents(
 def admin_run_collector() -> dict[str, str]:
     """
     Rulează collectorul manual, la cerere.
-    Nu rulează automat la startup.
+    Importul collectorului este lazy și se face doar când endpoint-ul este apelat.
     """
     try:
         logger.info("collector.manual_run.begin")
+        from app.collectors.collector_real import main as run_collector
+
         run_collector()
         logger.info("collector.manual_run.complete")
         return {
