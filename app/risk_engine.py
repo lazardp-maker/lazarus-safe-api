@@ -590,7 +590,6 @@ def get_heatmap_points(
     if points:
         return points
 
-    # fallback: dacă nu există coordonate reale, generăm puncte sintetice în jurul locației
     fallback_incidents = get_recent_incidents_for_fallback(
         lookback_days=lookback_days,
         limit=18,
@@ -636,12 +635,24 @@ def evaluate_risk(
                 "profile_found": False,
                 "lookback_days": lookback_days,
                 "incidents_analyzed": 0,
+                "heatmap_mode": "synthetic_fallback",
             },
         }
 
     profile = get_area_profile(county_n, city_n)
     incidents = get_recent_incidents(county_n, city_n, lookback_days)
     counts = build_counts_from_incidents(incidents)
+
+    geo_incidents_near_user: list[dict[str, Any]] = []
+    if user_lat is not None and user_lng is not None:
+        geo_incidents_near_user = get_incidents_near_point(
+            center_lat=user_lat,
+            center_lng=user_lng,
+            radius_m=3000,
+            lookback_days=lookback_days,
+        )
+
+    heatmap_mode = "real_geo" if geo_incidents_near_user else "synthetic_fallback"
 
     if not profile:
         return {
@@ -656,6 +667,7 @@ def evaluate_risk(
                 "profile_found": False,
                 "lookback_days": lookback_days,
                 "incidents_analyzed": len(incidents),
+                "heatmap_mode": heatmap_mode,
             },
         }
 
@@ -742,11 +754,6 @@ def evaluate_risk(
             "theft_coefficient": theft_c,
             "traffic_coefficient": traffic_c,
             "emergency_coefficient": emergency_c,
-            "heatmap_mode": "real_geo" if get_incidents_near_point(
-                center_lat=user_lat if user_lat is not None else 44.43,
-                center_lng=user_lng if user_lng is not None else 26.10,
-                radius_m=3000,
-                lookback_days=lookback_days,
-            ) else "synthetic_fallback",
+            "heatmap_mode": heatmap_mode,
         },
     }
