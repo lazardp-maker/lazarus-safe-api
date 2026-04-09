@@ -9,6 +9,7 @@ from app.db import get_connection
 DEFAULT_LOOKBACK_DAYS = 60
 DEFAULT_NEARBY_RADIUS_M = 3000
 DEFAULT_SEVERE_RADIUS_M = 1500
+DEFAULT_CRITICAL_RADIUS_M = 500
 
 INCIDENT_KEYS = (
     "homicide",
@@ -38,15 +39,15 @@ INCIDENT_LABELS = {
 }
 
 BASE_WEIGHTS = {
-    "homicide": 18.0,
-    "sexual_violence": 16.0,
-    "robbery": 13.0,
-    "violence": 8.0,
+    "homicide": 22.0,
+    "sexual_violence": 19.0,
+    "robbery": 15.0,
+    "violence": 8.5,
     "theft": 5.0,
-    "traffic": 4.0,
+    "traffic": 4.2,
     "emergency": 4.5,
-    "public_order": 3.2,
-    "general": 1.5,
+    "public_order": 3.5,
+    "general": 1.8,
 }
 
 SEVERITY_MULTIPLIERS = {
@@ -56,7 +57,7 @@ SEVERITY_MULTIPLIERS = {
     "low": 0.80,
 }
 
-HEATMAP_NORMALIZATION_DIVISOR = 18.0
+HEATMAP_NORMALIZATION_DIVISOR = 20.0
 
 
 def normalize_text(value: Optional[str]) -> Optional[str]:
@@ -92,6 +93,9 @@ def normalize_text(value: Optional[str]) -> Optional[str]:
         "county ",
         "city of ",
         "comuna ",
+        "satul ",
+        "sat ",
+        "localitatea ",
     )
     for prefix in prefixes:
         if value.startswith(prefix):
@@ -156,22 +160,22 @@ def recency_multiplier(days_ago: Optional[int]) -> float:
     days = safe_int(days_ago, -1)
 
     if days < 0:
-        return 0.70
+        return 0.72
     if days <= 1:
-        return 1.25
+        return 1.30
     if days <= 3:
-        return 1.10
+        return 1.15
     if days <= 7:
         return 1.00
     if days <= 14:
-        return 0.82
+        return 0.84
     if days <= 30:
-        return 0.62
+        return 0.65
     if days <= 60:
-        return 0.42
+        return 0.46
     if days <= 120:
-        return 0.25
-    return 0.15
+        return 0.28
+    return 0.16
 
 
 def source_multiplier(
@@ -206,26 +210,26 @@ def source_multiplier(
 
 def distance_band_multiplier(distance_m: Optional[float], same_city: bool) -> float:
     if distance_m is not None:
-        if distance_m <= 150:
-            return 1.60
+        if distance_m <= 100:
+            return 1.80
         if distance_m <= 300:
-            return 1.45
+            return 1.55
         if distance_m <= 700:
-            return 1.25
+            return 1.30
         if distance_m <= 1500:
-            return 1.05
+            return 1.08
         if distance_m <= 3000:
-            return 0.82
+            return 0.85
         if distance_m <= 7000:
-            return 0.58
+            return 0.60
         if distance_m <= 15000:
-            return 0.38
-        return 0.18
+            return 0.40
+        return 0.20
 
     if same_city:
-        return 0.55
+        return 0.56
 
-    return 0.18
+    return 0.20
 
 
 def format_distance(distance_m: Optional[float]) -> Optional[str]:
@@ -234,7 +238,9 @@ def format_distance(distance_m: Optional[float]) -> Optional[str]:
 
     d = float(distance_m)
     if d < 1000:
-        return f"{int(round(d / 10.0) * 10)} m"
+        rounded = int(round(d / 10.0) * 10)
+        rounded = max(10, rounded)
+        return f"{rounded} m"
     return f"{round(d / 1000.0, 1)} km"
 
 
@@ -558,8 +564,9 @@ def compute_heat_intensity(incident: dict[str, Any], center_lat: float, center_l
 
 def find_closest_severe_incident(incidents: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
     severe = [
-        item for item in incidents
-        if (item.get("incident_type") in SEVERE_INCIDENT_TYPES and item.get("distance_m") is not None)
+        item
+        for item in incidents
+        if item.get("incident_type") in SEVERE_INCIDENT_TYPES and item.get("distance_m") is not None
     ]
     if not severe:
         return None
@@ -572,11 +579,65 @@ def summarize_severity_groups(counts: dict[str, int]) -> tuple[int, int]:
     return severe_count, moderate_count
 
 
+def score_floor_from_severity(
+    counts: dict[str, int],
+    closest_severe: Optional[dict[str, Any]],
+) -> float:
+    severe_count, moderate_count = summarize_severity_groups(counts)
+    floor = 0.0
+
+    homicide_count = counts.get("homicide", 0)
+    sexual_count = counts.get("sexual_violence", 0)
+    robbery_count = counts.get("robbery", 0)
+
+    if homicide_count > 0:
+        floor = max(floor, 8.2)
+    if sexual_count > 0:
+        floor = max(floor, 7.4)
+    if robbery_count > 0:
+        floor = max(floor, 6.4)
+
+    if severe_count >= 2:
+        floor = max(floor, 7.0)
+    elif severe_count == 1:
+        floor = max(floor, 5.8)
+
+    if moderate_count >= 5:
+        floor = max(floor, 4.2)
+    elif moderate_count >= 2:
+        floor = max(floor, 2.2)
+
+    if closest_severe is not None:
+        distance_m = safe_float(closest_severe.get("distance_m"), 999999.0)
+        incident_type = closest_severe.get("incident_type")
+
+        if incident_type == "homicide":
+            if distance_m <= 300:
+                floor = max(floor, 9.0)
+            elif distance_m <= 1500:
+                floor = max(floor, 8.4)
+
+        elif incident_type == "sexual_violence":
+            if distance_m <= 300:
+                floor = max(floor, 8.3)
+            elif distance_m <= 1500:
+                floor = max(floor, 7.6)
+
+        elif incident_type == "robbery":
+            if distance_m <= 300:
+                floor = max(floor, 7.2)
+            elif distance_m <= 1500:
+                floor = max(floor, 6.6)
+
+    return floor
+
+
 def build_reason_message(
     counts: dict[str, int],
     closest_severe: Optional[dict[str, Any]],
     nearby_geo_incidents: list[dict[str, Any]],
     lookback_days: int,
+    confidence: float,
 ) -> str:
     severe_count, moderate_count = summarize_severity_groups(counts)
 
@@ -584,21 +645,31 @@ def build_reason_message(
         label = incident_label(closest_severe.get("incident_type"))
         distance_text = format_distance(closest_severe.get("distance_m")) or "aproape"
         days = closest_severe.get("days_ago")
+
         if days is None:
             time_text = "recent"
-        elif safe_int(days, 999) <= 1:
-            time_text = "în ultimele 24 de ore"
-        elif safe_int(days, 999) <= 7:
-            time_text = f"în ultimele {safe_int(days, 0)} zile"
         else:
-            time_text = "în perioada recentă"
+            days_i = safe_int(days, 999)
+            if days_i <= 1:
+                time_text = "în ultimele 24 de ore"
+            elif days_i <= 7:
+                time_text = f"în ultimele {days_i} zile"
+            elif days_i <= 30:
+                time_text = "în ultima lună"
+            else:
+                time_text = f"în ultimele {lookback_days} zile"
 
         return (
-            f"Atenție: la aproximativ {distance_text} de această locație a fost raportat "
+            f"La aproximativ {distance_text} de această locație a fost raportat "
             f"un caz de {label} {time_text}."
         )
 
     if severe_count > 0:
+        if severe_count == 1:
+            return (
+                f"În zona analizată a fost identificat 1 incident grav "
+                f"în ultimele {lookback_days} zile."
+            )
         return (
             f"În zona analizată au fost identificate {severe_count} incidente grave "
             f"în ultimele {lookback_days} zile."
@@ -607,7 +678,7 @@ def build_reason_message(
     if moderate_count >= 4:
         return (
             f"În apropiere au fost raportate mai multe incidente relevante "
-            f"în ultimele {lookback_days} zile. Se recomandă prudență."
+            f"în ultimele {lookback_days} zile."
         )
 
     if moderate_count > 0:
@@ -622,53 +693,102 @@ def build_reason_message(
             "dar există semnale limitate în zona extinsă analizată."
         )
 
+    if confidence < 0.35:
+        return (
+            "Nu au fost identificate incidente relevante, însă volumul de date disponibil "
+            "pentru această zonă este încă limitat."
+        )
+
     return (
-        f"Nu au fost identificate incidente relevante în proximitatea analizată "
-        f"în ultimele {lookback_days} zile."
+        f"Nu au fost identificate incidente grave sau semnale relevante "
+        f"în proximitatea analizată în ultimele {lookback_days} zile."
     )
 
 
-def classify_level(score_0_10: float, counts: dict[str, int], closest_severe: Optional[dict[str, Any]]) -> str:
+def classify_level(
+    score_0_10: float,
+    counts: dict[str, int],
+    closest_severe: Optional[dict[str, Any]],
+    confidence: float,
+) -> str:
     severe_count, moderate_count = summarize_severity_groups(counts)
+
+    if confidence < 0.20 and severe_count == 0 and moderate_count == 0:
+        return "Date insuficiente"
 
     if closest_severe is not None:
         distance_m = safe_float(closest_severe.get("distance_m"), 999999.0)
-        if distance_m <= 500:
+        incident_type = closest_severe.get("incident_type")
+
+        if incident_type == "homicide" and distance_m <= DEFAULT_SEVERE_RADIUS_M:
+            return "Atenționare serioasă"
+        if incident_type == "sexual_violence" and distance_m <= DEFAULT_SEVERE_RADIUS_M:
+            return "Atenționare serioasă"
+        if incident_type == "robbery" and distance_m <= DEFAULT_CRITICAL_RADIUS_M:
             return "Atenționare serioasă"
 
-    if severe_count >= 2 and score_0_10 >= 7.0:
+    if severe_count >= 2:
         return "Atenționare serioasă"
-    if severe_count >= 1 and score_0_10 >= 5.5:
+
+    if severe_count == 1:
+        if score_0_10 >= 7.0:
+            return "Atenționare serioasă"
         return "Prudență ridicată"
+
     if score_0_10 >= 7.5:
         return "Atenționare serioasă"
-    if score_0_10 >= 4.0:
+    if score_0_10 >= 4.2:
         return "Prudență ridicată"
     if score_0_10 >= 1.8 or moderate_count >= 2:
         return "Prudență"
+
     return "Situație stabilă"
 
 
-def build_ui_message(level: str, base_reason: str) -> str:
+def build_ui_message(level: str, base_reason: str, confidence: float) -> str:
+    if level == "Date insuficiente":
+        return (
+            f"{base_reason} Evaluarea este orientativă deoarece există încă puține date "
+            "disponibile pentru această zonă."
+        )
+
     if level == "Situație stabilă":
+        if confidence < 0.35:
+            return (
+                f"{base_reason} Zona pare stabilă în acest moment, dar nivelul de încredere "
+                "al evaluării este încă limitat."
+            )
         return f"{base_reason} Zona este considerată stabilă în acest moment."
+
     if level == "Prudență":
-        return f"{base_reason} Se recomandă atenție normală și evitarea expunerii inutile."
+        return (
+            f"{base_reason} Se recomandă atenție normală și evitarea expunerii inutile, "
+            "mai ales în intervale vulnerabile."
+        )
+
     if level == "Prudență ridicată":
-        return f"{base_reason} Se recomandă vigilență sporită și evitarea deplasărilor neesențiale în intervale vulnerabile."
-    return f"{base_reason} Se recomandă vigilență maximă și evitarea zonelor vulnerabile."
+        return (
+            f"{base_reason} Se recomandă vigilență sporită și evitarea deplasărilor "
+            "neesențiale în intervale vulnerabile."
+        )
+
+    return (
+        f"{base_reason} Se recomandă vigilență maximă și evitarea zonelor sau "
+        "intervalelor vulnerabile."
+    )
+
 
 def normalize_score_to_ten(raw_score: float) -> float:
     """
     Transformă scorul brut într-o scară 0–10.
-    Funcția logaritmică evită:
-    - scor 0 când există incidente grave
-    - scor 10 prea ușor în orașe mari
+    Funcția logaritmică:
+    - evită scoruri 0 când există risc real,
+    - evită saturarea prea rapidă la 10 în zonele urbane dense.
     """
     if raw_score <= 0:
         return 0.0
 
-    normalized = 10.0 * (1 - math.exp(-raw_score / 22.0))
+    normalized = 10.0 * (1 - math.exp(-raw_score / 24.0))
     return round(clamp(normalized, 0.0, 10.0), 1)
 
 
@@ -795,8 +915,8 @@ def evaluate_risk(
     incident_score_total = 0.0
     for incident in incidents_area_enriched:
         points = compute_incident_risk_points(incident)
-
         incident_type = incident.get("incident_type") or "general"
+
         if incident_type in {"violence", "homicide", "sexual_violence", "robbery"}:
             points *= max(1.0, violence_c)
         elif incident_type == "theft":
@@ -808,47 +928,82 @@ def evaluate_risk(
 
         incident_score_total += points
 
-    profile_modifier = max(0.80, crime_c)
+    profile_modifier = max(0.82, crime_c)
     raw_score = incident_score_total * profile_modifier
 
-    # Bonus de alertare pentru incidente grave apropiate.
     if closest_severe is not None:
         distance_m = safe_float(closest_severe.get("distance_m"), 999999.0)
-        if distance_m <= 150:
-            raw_score += 18.0
-        elif distance_m <= 300:
-            raw_score += 14.0
-        elif distance_m <= 700:
-            raw_score += 10.0
-        elif distance_m <= 1500:
-            raw_score += 6.0
+        incident_type = closest_severe.get("incident_type")
 
-    # Bonus pentru volum de incidente grave în proximitate reală.
-    raw_score += min(len(severe_geo_incidents) * 2.4, 10.0)
+        if incident_type == "homicide":
+            if distance_m <= 150:
+                raw_score += 24.0
+            elif distance_m <= 300:
+                raw_score += 20.0
+            elif distance_m <= 700:
+                raw_score += 16.0
+            elif distance_m <= 1500:
+                raw_score += 11.0
 
-    score_0_10 = normalize_score_to_ten(raw_score)
+        elif incident_type == "sexual_violence":
+            if distance_m <= 150:
+                raw_score += 21.0
+            elif distance_m <= 300:
+                raw_score += 17.0
+            elif distance_m <= 700:
+                raw_score += 13.0
+            elif distance_m <= 1500:
+                raw_score += 9.0
+
+        elif incident_type == "robbery":
+            if distance_m <= 150:
+                raw_score += 16.0
+            elif distance_m <= 300:
+                raw_score += 13.0
+            elif distance_m <= 700:
+                raw_score += 10.0
+            elif distance_m <= 1500:
+                raw_score += 7.0
+
+    raw_score += min(len(severe_geo_incidents) * 2.8, 12.0)
+
+    preliminary_score_0_10 = normalize_score_to_ten(raw_score)
+    score_floor = score_floor_from_severity(counts, closest_severe)
+    score_0_10 = round(max(preliminary_score_0_10, score_floor), 1)
+
+    verified_count = sum(1 for item in incidents_area_enriched if safe_int(item.get("is_verified"), 0) == 1)
+    geo_count = sum(
+        1
+        for item in incidents_area_enriched
+        if item.get("latitude") is not None and item.get("longitude") is not None
+    )
+
+    confidence = 0.24
+    confidence += 0.18 if profile else 0.0
+    confidence += min(len(incidents_area_enriched) * 0.02, 0.16)
+    confidence += min(verified_count * 0.03, 0.18)
+    confidence += min(geo_count * 0.02, 0.15)
+
+    if city_n and not any(item.get("city") for item in incidents_area_enriched):
+        confidence -= 0.04
+
+    confidence = round(clamp(confidence, 0.0, 0.97), 2)
+
+    level = classify_level(
+        score_0_10=score_0_10,
+        counts=counts,
+        closest_severe=closest_severe,
+        confidence=confidence,
+    )
 
     base_reason = build_reason_message(
         counts=counts,
         closest_severe=closest_severe,
         nearby_geo_incidents=nearby_geo_incidents,
         lookback_days=lookback_days,
+        confidence=confidence,
     )
-    level = classify_level(score_0_10, counts, closest_severe)
-    message = build_ui_message(level, base_reason)
-
-    verified_count = sum(1 for item in incidents_area_enriched if safe_int(item.get("is_verified"), 0) == 1)
-    geo_count = sum(
-        1 for item in incidents_area_enriched
-        if item.get("latitude") is not None and item.get("longitude") is not None
-    )
-
-    confidence = 0.28
-    confidence += 0.18 if profile else 0.0
-    confidence += min(len(incidents_area_enriched) * 0.02, 0.16)
-    confidence += min(verified_count * 0.03, 0.18)
-    confidence += min(geo_count * 0.02, 0.15)
-    confidence = round(clamp(confidence, 0.0, 0.97), 2)
+    message = build_ui_message(level, base_reason, confidence)
 
     closest_severe_payload = None
     if closest_severe is not None:
@@ -888,6 +1043,8 @@ def evaluate_risk(
             "moderate_count": moderate_count,
             "severe_nearby_count": len(severe_geo_incidents),
             "raw_score": round(raw_score, 2),
+            "preliminary_score_0_10": preliminary_score_0_10,
+            "score_floor": score_floor,
             "incident_score_total": round(incident_score_total, 2),
             "crime_coefficient": crime_c,
             "violence_coefficient": violence_c,
@@ -900,6 +1057,7 @@ def evaluate_risk(
                 "show_closest_severe_banner": closest_severe_payload is not None,
                 "show_distance_to_severe": closest_severe_payload is not None,
                 "show_stable_label": level == "Situație stabilă",
+                "show_insufficient_data_hint": level == "Date insuficiente" or confidence < 0.35,
             },
         },
     }
