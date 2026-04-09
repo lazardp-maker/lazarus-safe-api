@@ -22,7 +22,7 @@ from app.risk_engine import (
     get_heatmap_points,
     get_sources_used,
 )
-from app.schemas import AnalyzeRequest, AnalyzeResponse
+from app.schemas import AnalyzeRequest, AnalyzeResponse, ClosestSevereIncident
 
 APP_NAME = "Lazarus Safe API"
 APP_VERSION = os.getenv("APP_VERSION", "3.4.0")
@@ -227,7 +227,6 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
             exc,
         )
 
-    # fallback minimal
     if 44.3 <= lat <= 44.6 and 25.9 <= lng <= 26.3:
         return "bucuresti", "bucuresti"
 
@@ -281,13 +280,17 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
 
     if not county:
         return AnalyzeResponse(
-            level="UNKNOWN",
+            level="Date insuficiente",
+            score=0.0,
             message="Nu am putut identifica județul sau localitatea pentru coordonatele primite.",
             county=None,
             city=None,
             incidents_summary=empty_incidents_summary(),
+            incidents_count=0,
             sources_used=[],
             confidence=0.0,
+            confidence_percent=0.0,
+            closest_severe_incident=None,
             analyzed_at=analyzed_at,
             debug={
                 "reason": "reverse_geocode_failed",
@@ -312,13 +315,17 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
             exc,
         )
         return AnalyzeResponse(
-            level="UNKNOWN",
+            level="Date insuficiente",
+            score=0.0,
             message="Locația a fost identificată, dar analiza de risc a eșuat.",
             county=county,
             city=city,
             incidents_summary=empty_incidents_summary(),
+            incidents_count=0,
             sources_used=[],
             confidence=0.0,
+            confidence_percent=0.0,
+            closest_severe_incident=None,
             analyzed_at=analyzed_at,
             debug={
                 "reason": "risk_engine_failed",
@@ -336,13 +343,17 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
             type(result).__name__,
         )
         return AnalyzeResponse(
-            level="UNKNOWN",
+            level="Date insuficiente",
+            score=0.0,
             message="Analiza nu a returnat un rezultat valid.",
             county=county,
             city=city,
             incidents_summary=empty_incidents_summary(),
+            incidents_count=0,
             sources_used=[],
             confidence=0.0,
+            confidence_percent=0.0,
+            closest_severe_incident=None,
             analyzed_at=analyzed_at,
             debug={
                 "reason": "invalid_risk_result",
@@ -351,16 +362,49 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
             },
         )
 
+    incidents_summary = incidents_summary_to_dict(
+        result.get("incidents_summary", empty_incidents_summary())
+    )
+    incidents_count = sum(int(v) for v in incidents_summary.values())
+    confidence_raw = float(result.get("confidence", 0.0) or 0.0)
+    confidence_percent = round(confidence_raw * 100.0, 1)
+
+    closest_raw = result.get("closest_severe_incident")
+    closest_payload = None
+    if isinstance(closest_raw, dict):
+        closest_payload = ClosestSevereIncident(
+            incident_id=closest_raw.get("incident_id"),
+            incident_type=closest_raw.get("incident_type"),
+            incident_label=closest_raw.get("incident_label"),
+            distance_m=closest_raw.get("distance_m"),
+            distance_text=closest_raw.get("distance_text"),
+            days_ago=closest_raw.get("days_ago"),
+            city=closest_raw.get("city"),
+            county=closest_raw.get("county"),
+            title=closest_raw.get("title"),
+            summary=closest_raw.get("summary"),
+            latitude=closest_raw.get("latitude"),
+            longitude=closest_raw.get("longitude"),
+            published_date=closest_raw.get("published_date"),
+            official_confirmation=bool(closest_raw.get("official_confirmation", False)),
+            primary_source_name=closest_raw.get("primary_source_name"),
+            primary_source_type=closest_raw.get("primary_source_type"),
+            primary_source_url=closest_raw.get("primary_source_url"),
+            primary_source_title=closest_raw.get("primary_source_title"),
+        )
+
     return AnalyzeResponse(
-        level=result.get("level", "UNKNOWN"),
+        level=result.get("level", "Date insuficiente"),
+        score=float(result.get("score_internal", 0.0) or 0.0),
         message=result.get("message", "Analiza nu a putut fi completată."),
         county=county,
         city=city,
-        incidents_summary=incidents_summary_to_dict(
-            result.get("incidents_summary", empty_incidents_summary())
-        ),
+        incidents_summary=incidents_summary,
+        incidents_count=incidents_count,
         sources_used=sources_used if isinstance(sources_used, list) else [],
-        confidence=float(result.get("confidence", 0.0) or 0.0),
+        confidence=confidence_raw,
+        confidence_percent=confidence_percent,
+        closest_severe_incident=closest_payload,
         analyzed_at=analyzed_at,
         debug=result.get("meta") if isinstance(result.get("meta"), dict) else {},
     )
@@ -677,30 +721,24 @@ def get_risk(
     payload = AnalyzeRequest(lat=lat, lng=lng)
     result = build_analysis_response(payload)
 
-    summary_dict = incidents_summary_to_dict(result.incidents_summary)
-    total_incidents = sum(
-        int(v) for v in summary_dict.values() if isinstance(v, (int, float))
-    )
-
-    confidence_raw = float(result.confidence) if result.confidence is not None else 0.0
-    confidence_percent = round(confidence_raw * 100.0, 1)
-
-    debug = result.debug if isinstance(result.debug, dict) else {}
-    closest_severe = debug.get("closest_severe_incident")
-
     return {
         "risk_level": result.level,
+        "score": result.score,
         "message": result.message,
         "county": result.county,
         "city": result.city,
-        "confidence": confidence_raw,
-        "confidence_percent": confidence_percent,
-        "incidents_summary": summary_dict,
-        "incidents_count": total_incidents,
+        "confidence": result.confidence,
+        "confidence_percent": result.confidence_percent,
+        "incidents_summary": result.incidents_summary.model_dump(),
+        "incidents_count": result.incidents_count,
         "sources_used": result.sources_used,
-        "closest_severe_incident": closest_severe,
+        "closest_severe_incident": (
+            result.closest_severe_incident.model_dump()
+            if result.closest_severe_incident is not None
+            else None
+        ),
         "analyzed_at": result.analyzed_at,
-        "debug": debug,
+        "debug": result.debug,
     }
 
 
@@ -752,508 +790,16 @@ def home() -> str:
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>Lazarus Safe</title>
-
-        <link
-            rel="stylesheet"
-            href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-            integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-            crossorigin=""
-        />
-
-        <style>
-            * { box-sizing: border-box; }
-
-            body {
-                margin: 0;
-                font-family: Arial, sans-serif;
-                background: #08142f;
-                color: white;
-            }
-
-            #map {
-                height: 100vh;
-                width: 100%;
-            }
-
-            .panel {
-                position: absolute;
-                top: 20px;
-                left: 20px;
-                z-index: 1000;
-                width: 410px;
-                max-width: calc(100% - 40px);
-                background: rgba(15, 31, 74, 0.96);
-                border-radius: 18px;
-                padding: 18px;
-                box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
-                border: 1px solid rgba(255,255,255,0.08);
-            }
-
-            .brand {
-                margin: 0 0 6px 0;
-                font-size: 24px;
-                font-weight: 700;
-            }
-
-            .subtitle {
-                margin: 0 0 14px 0;
-                color: #d7e4ff;
-                font-size: 14px;
-                line-height: 1.45;
-            }
-
-            .actions {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 10px;
-                margin-bottom: 12px;
-            }
-
-            button {
-                flex: 1 1 110px;
-                padding: 11px 12px;
-                border: none;
-                border-radius: 10px;
-                cursor: pointer;
-                font-size: 14px;
-                font-weight: bold;
-                transition: 0.2s ease;
-            }
-
-            button:hover { transform: translateY(-1px); }
-
-            .btn-primary { background: #ffffff; color: #0b1736; }
-            .btn-secondary { background: #1f3776; color: #ffffff; }
-            .btn-ghost { background: #162a60; color: #ffffff; }
-
-            .status {
-                margin-top: 6px;
-                padding: 14px;
-                border-radius: 12px;
-                background: rgba(255,255,255,0.06);
-                font-size: 14px;
-                line-height: 1.5;
-                max-height: 62vh;
-                overflow: auto;
-            }
-
-            .risk-badge {
-                display: inline-block;
-                margin-top: 8px;
-                padding: 6px 10px;
-                border-radius: 999px;
-                font-size: 12px;
-                font-weight: bold;
-                letter-spacing: 0.3px;
-            }
-
-            .risk-low { background: rgba(46, 204, 113, 0.18); color: #7CFFB2; }
-            .risk-medium { background: rgba(241, 196, 15, 0.18); color: #FFD95B; }
-            .risk-high { background: rgba(231, 76, 60, 0.18); color: #FF8E82; }
-            .risk-unknown { background: rgba(255,255,255,0.12); color: #ECECEC; }
-
-            .muted {
-                color: #b7c8ef;
-                font-size: 13px;
-            }
-
-            .small-title {
-                margin-top: 10px;
-                margin-bottom: 6px;
-                font-size: 13px;
-                font-weight: bold;
-                color: #ffffff;
-            }
-
-            .small-list {
-                margin: 8px 0 0 18px;
-                padding: 0;
-                color: #e5ecff;
-                font-size: 13px;
-            }
-
-            .footer-note {
-                margin-top: 10px;
-                font-size: 12px;
-                color: #9fb1e8;
-            }
-
-            .closest-alert {
-                margin-top: 10px;
-                padding: 10px;
-                border-radius: 10px;
-                background: rgba(231, 76, 60, 0.14);
-                border: 1px solid rgba(231, 76, 60, 0.25);
-            }
-
-            code {
-                background: rgba(255,255,255,0.08);
-                padding: 2px 6px;
-                border-radius: 6px;
-                font-size: 12px;
-            }
-
-            @media (max-width: 768px) {
-                .panel {
-                    top: 12px;
-                    left: 12px;
-                    right: 12px;
-                    width: auto;
-                    max-width: none;
-                }
-
-                .actions {
-                    flex-direction: column;
-                }
-            }
-        </style>
     </head>
-    <body>
-        <div id="map"></div>
-
-        <div class="panel">
-            <h1 class="brand">Lazarus Safe</h1>
-            <p class="subtitle">
-                Evaluare rapidă a riscului de securitate fizică pe baza locației și a incidentelor relevante.
-            </p>
-
-            <div class="actions">
-                <button class="btn-primary" onclick="checkRisk()">Verifică zona</button>
-                <button class="btn-secondary" onclick="useMyLocation()">Locația mea</button>
-                <button class="btn-ghost" onclick="toggleHeatmap()">Arată / Ascunde heatmap</button>
-            </div>
-
-            <div id="result" class="status">
-                Selectează o locație pe hartă sau apasă pe <strong>Locația mea</strong>.
-            </div>
-
-            <div class="footer-note">
-                API: <code>GET /risk</code> și <code>GET /heatmap</code>
-            </div>
-        </div>
-
-        <script
-            src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-            integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-            crossorigin=""
-        ></script>
-        <script src="https://unpkg.com/leaflet.heat/dist/leaflet-heat.js"></script>
-
-        <script>
-            const map = L.map("map").setView([44.4268, 26.1025], 13);
-
-            L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-                maxZoom: 19,
-                attribution: "&copy; OpenStreetMap contributors"
-            }).addTo(map);
-
-            let marker = null;
-            let selectedLat = null;
-            let selectedLng = null;
-            let heatLayer = null;
-            let heatCircles = [];
-            let heatmapVisible = false;
-
-            function setMarker(lat, lng) {
-                selectedLat = lat;
-                selectedLng = lng;
-
-                if (marker) {
-                    map.removeLayer(marker);
-                }
-
-                marker = L.marker([lat, lng]).addTo(map);
-                map.setView([lat, lng], 15);
-            }
-
-            function clearHeatmapLayers() {
-                if (heatLayer) {
-                    map.removeLayer(heatLayer);
-                    heatLayer = null;
-                }
-
-                if (heatCircles.length) {
-                    heatCircles.forEach(layer => {
-                        try { map.removeLayer(layer); } catch (e) {}
-                    });
-                    heatCircles = [];
-                }
-            }
-
-            function getCircleColor(intensity) {
-                if (intensity >= 0.85) return "#ff0000";
-                if (intensity >= 0.65) return "#ff7a00";
-                if (intensity >= 0.45) return "#ffd400";
-                if (intensity >= 0.25) return "#7dff00";
-                return "#00a3ff";
-            }
-
-            function drawCircleFallback(points) {
-                clearHeatmapLayers();
-
-                heatCircles = points.map((p) => {
-                    const intensity = Math.max(Number(p.intensity || 0.25), 0.20);
-                    const radius = 120 + (intensity * 260);
-
-                    return L.circle([Number(p.lat), Number(p.lng)], {
-                        radius: radius,
-                        color: getCircleColor(intensity),
-                        fillColor: getCircleColor(intensity),
-                        fillOpacity: Math.min(0.18 + intensity * 0.35, 0.55),
-                        weight: 1
-                    }).addTo(map);
-                });
-            }
-
-            map.on("click", function (e) {
-                setMarker(e.latlng.lat, e.latlng.lng);
-                document.getElementById("result").innerHTML = `
-                    <div><strong>Locație selectată</strong></div>
-                    <div class="muted">Lat: ${e.latlng.lat.toFixed(6)}, Lng: ${e.latlng.lng.toFixed(6)}</div>
-                    <div class="footer-note">Apasă pe „Verifică zona”.</div>
-                `;
-            });
-
-            function getRiskClass(level) {
-                const value = (level || "").toUpperCase();
-
-                if (
-                    value.includes("LOW") ||
-                    value.includes("SAFE") ||
-                    value.includes("SCAZUT") ||
-                    value.includes("STABILA")
-                ) return "risk-low";
-
-                if (
-                    value.includes("MED") ||
-                    value.includes("MODERAT") ||
-                    value === "PRUDENȚĂ" ||
-                    value === "PRUDENTA"
-                ) return "risk-medium";
-
-                if (
-                    value.includes("HIGH") ||
-                    value.includes("RIDICAT") ||
-                    value.includes("SEVER") ||
-                    value.includes("SERIOASA")
-                ) return "risk-high";
-
-                return "risk-unknown";
-            }
-
-            function buildIncidentsList(summary) {
-                if (!summary || typeof summary !== "object") {
-                    return "<div class='muted'>Fără sumar incidente.</div>";
-                }
-
-                const labels = {
-                    homicide: "Omor",
-                    sexual_violence: "Violență sexuală",
-                    robbery: "Tâlhărie",
-                    theft: "Furt",
-                    violence: "Violență",
-                    traffic: "Trafic",
-                    emergency: "Urgențe",
-                    public_order: "Ordine publică",
-                    general: "General"
-                };
-
-                const items = Object.entries(summary)
-                    .filter(([_, value]) => Number(value) > 0)
-                    .map(([key, value]) => `<li>${labels[key] || key}: ${value}</li>`);
-
-                if (!items.length) {
-                    return "<div class='muted'>Nu au fost identificate incidente relevante în sumar.</div>";
-                }
-
-                return `<ul class="small-list">${items.join("")}</ul>`;
-            }
-
-            function buildClosestSevere(data) {
-                const item = data.closest_severe_incident;
-                if (!item) return "";
-
-                return `
-                    <div class="closest-alert">
-                        <div><strong>Incident grav apropiat</strong></div>
-                        <div class="muted">Tip: ${item.incident_label || item.incident_type || "-"}</div>
-                        <div class="muted">Distanță: ${item.distance_text || "-"}</div>
-                        <div class="muted">Zonă: ${item.city || "-"}${item.county ? ", " + item.county : ""}</div>
-                        <div class="muted">Titlu: ${item.title || "-"}</div>
-                    </div>
-                `;
-            }
-
-            async function checkRisk() {
-                if (selectedLat === null || selectedLng === null) {
-                    alert("Selectează mai întâi o locație.");
-                    return;
-                }
-
-                const resultBox = document.getElementById("result");
-                resultBox.innerHTML = "Se analizează locația...";
-
-                try {
-                    const response = await fetch(`/risk?lat=${selectedLat}&lng=${selectedLng}`);
-                    if (!response.ok) {
-                        throw new Error(`HTTP ${response.status}`);
-                    }
-
-                    const data = await response.json();
-                    const riskClass = getRiskClass(data.risk_level);
-
-                    resultBox.innerHTML = `
-                        <div>
-                            <strong>${data.city || "Localitate necunoscută"}</strong>
-                            ${data.county ? `, ${data.county}` : ""}
-                        </div>
-
-                        <div class="risk-badge ${riskClass}">
-                            Risc: ${data.risk_level || "UNKNOWN"}
-                        </div>
-
-                        <p style="margin-top:10px; margin-bottom:6px;">
-                            ${data.message || "Nu există mesaj disponibil."}
-                        </p>
-
-                        ${buildClosestSevere(data)}
-
-                        <div class="muted" style="margin-top:8px;">
-                            Confidence: ${Number(data.confidence_percent || 0).toFixed(1)}%
-                        </div>
-
-                        <div class="muted">
-                            Incidente totale: ${data.incidents_count || 0}
-                        </div>
-
-                        <div class="small-title">Sumar incidente:</div>
-                        ${buildIncidentsList(data.incidents_summary)}
-
-                        <div class="footer-note">
-                            Analizat la: ${data.analyzed_at || "-"}
-                        </div>
-                    `;
-
-                    if (heatmapVisible) {
-                        await loadHeatmap();
-                    }
-                } catch (error) {
-                    resultBox.innerHTML = `
-                        <div><strong>Eroare la analiză</strong></div>
-                        <div class="muted">${error.message}</div>
-                    `;
-                }
-            }
-
-            async function loadHeatmap() {
-                if (selectedLat === null || selectedLng === null) {
-                    alert("Selectează mai întâi o locație.");
-                    return;
-                }
-
-                const response = await fetch(
-                    `/heatmap?lat=${selectedLat}&lng=${selectedLng}&radius_m=10000&lookback_days=365`
-                );
-
-                if (!response.ok) {
-                    throw new Error(`Heatmap HTTP ${response.status}`);
-                }
-
-                const data = await response.json();
-                clearHeatmapLayers();
-
-                if (!data.points || !data.points.length) {
-                    alert("Nu există puncte pentru heatmap.");
-                    return;
-                }
-
-                const heatData = data.points.map((p) => [
-                    Number(p.lat),
-                    Number(p.lng),
-                    Math.max(Number(p.intensity || 0.2) * 5, 0.35)
-                ]);
-
-                if (typeof L.heatLayer === "function") {
-                    try {
-                        heatLayer = L.heatLayer(heatData, {
-                            radius: 55,
-                            blur: 38,
-                            maxZoom: 17,
-                            minOpacity: 0.40,
-                            max: 1.0,
-                            gradient: {
-                                0.20: "#00a3ff",
-                                0.40: "#7dff00",
-                                0.60: "#ffd400",
-                                0.80: "#ff7a00",
-                                1.00: "#ff0000"
-                            }
-                        }).addTo(map);
-                        return;
-                    } catch (err) {
-                        console.error("heatLayer failed, fallback to circles", err);
-                    }
-                }
-
-                drawCircleFallback(data.points);
-            }
-
-            async function toggleHeatmap() {
-                if (selectedLat === null || selectedLng === null) {
-                    alert("Selectează mai întâi o locație.");
-                    return;
-                }
-
-                heatmapVisible = !heatmapVisible;
-
-                if (!heatmapVisible) {
-                    clearHeatmapLayers();
-                    return;
-                }
-
-                try {
-                    await loadHeatmap();
-                } catch (error) {
-                    console.error(error);
-                    drawCircleFallback([
-                        { lat: selectedLat, lng: selectedLng, intensity: 0.8 }
-                    ]);
-                }
-            }
-
-            function useMyLocation() {
-                if (!navigator.geolocation) {
-                    alert("Browserul nu suportă geolocația.");
-                    return;
-                }
-
-                navigator.geolocation.getCurrentPosition(
-                    function (position) {
-                        const lat = position.coords.latitude;
-                        const lng = position.coords.longitude;
-
-                        setMarker(lat, lng);
-
-                        document.getElementById("result").innerHTML = `
-                            <div><strong>Locația ta a fost detectată</strong></div>
-                            <div class="muted">Lat: ${lat.toFixed(6)}, Lng: ${lng.toFixed(6)}</div>
-                            <div class="footer-note">Apasă pe „Verifică zona”.</div>
-                        `;
-                    },
-                    function (error) {
-                        document.getElementById("result").innerHTML = `
-                            <div><strong>Nu am putut obține locația</strong></div>
-                            <div class="muted">${error.message}</div>
-                        `;
-                    },
-                    {
-                        enableHighAccuracy: true,
-                        timeout: 10000,
-                        maximumAge: 0
-                    }
-                );
-            }
-        </script>
+    <body style="font-family: Arial, sans-serif; padding: 24px;">
+        <h1>Lazarus Safe API</h1>
+        <p>API activ.</p>
+        <ul>
+            <li>POST /analyze</li>
+            <li>POST /location-risk</li>
+            <li>GET /risk</li>
+            <li>GET /heatmap</li>
+        </ul>
     </body>
     </html>
     """

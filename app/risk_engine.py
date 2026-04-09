@@ -244,12 +244,6 @@ def format_distance(distance_m: Optional[float]) -> Optional[str]:
     return f"{round(d / 1000.0, 1)} km"
 
 
-def title_case_location(value: Optional[str]) -> Optional[str]:
-    if not value:
-        return value
-    return " ".join(part.capitalize() for part in str(value).split())
-
-
 def incident_label(incident_type: Optional[str]) -> str:
     return INCIDENT_LABELS.get(incident_type or "general", INCIDENT_LABELS["general"])
 
@@ -357,6 +351,8 @@ def get_recent_incidents(
             is_verified,
             verification_status,
             source_priority,
+            primary_source_id,
+            article_id,
             created_at
         FROM incidents
         WHERE {" AND ".join(where_parts)}
@@ -401,6 +397,8 @@ def get_incidents_near_point(
                 is_verified,
                 verification_status,
                 source_priority,
+                primary_source_id,
+                article_id,
                 created_at
             FROM incidents
             WHERE latitude IS NOT NULL
@@ -632,9 +630,150 @@ def score_floor_from_severity(
     return floor
 
 
+def normalize_score_to_ten(raw_score: float) -> float:
+    if raw_score <= 0:
+        return 0.0
+
+    normalized = 10.0 * (1 - math.exp(-raw_score / 24.0))
+    return round(clamp(normalized, 0.0, 10.0), 1)
+
+
+def is_official_source_name(name: Optional[str]) -> bool:
+    value = normalize_text(name) or ""
+    official_tokens = (
+        "politia",
+        "ipj",
+        "mai",
+        "isu",
+        "igsu",
+        "dsu",
+        "parchet",
+        "diicot",
+        "jandarmeria",
+    )
+    return any(token in value for token in official_tokens)
+
+
+def get_incident_source_candidates(incident_id: int) -> list[dict[str, Any]]:
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT
+                s.id AS source_id,
+                s.name AS source_name,
+                s.source_type AS source_type,
+                s.trust_level AS trust_level,
+                im.mention_url AS mention_url,
+                im.mention_title AS mention_title,
+                im.published_date AS mention_published_date,
+                a.url AS article_url,
+                a.title AS article_title,
+                a.published_at AS article_published_at
+            FROM incident_mentions im
+            JOIN sources s ON s.id = im.source_id
+            LEFT JOIN articles a ON a.id = im.article_id
+            WHERE im.incident_id = ?
+            ORDER BY
+                CASE
+                    WHEN s.source_type = 'official' THEN 0
+                    WHEN s.source_type = 'press' THEN 1
+                    ELSE 2
+                END,
+                s.trust_level DESC,
+                COALESCE(im.published_date, a.published_at, '') DESC,
+                s.name ASC
+            """,
+            (incident_id,),
+        )
+        rows = cursor.fetchall()
+
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["is_official"] = bool(
+            item.get("source_type") == "official" or is_official_source_name(item.get("source_name"))
+        )
+        result.append(item)
+
+    return result
+
+
+def select_primary_source_for_incident(incident: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not incident:
+        return None
+
+    incident_id = safe_int(incident.get("id"), 0)
+    if incident_id <= 0:
+        return None
+
+    candidates = get_incident_source_candidates(incident_id)
+    if not candidates:
+        return None
+
+    official_candidates = [item for item in candidates if item.get("is_official")]
+    chosen = official_candidates[0] if official_candidates else candidates[0]
+
+    url = chosen.get("mention_url") or chosen.get("article_url")
+    title = chosen.get("mention_title") or chosen.get("article_title")
+    published_date = chosen.get("mention_published_date") or chosen.get("article_published_at")
+
+    return {
+        "source_id": chosen.get("source_id"),
+        "source_name": chosen.get("source_name"),
+        "source_type": chosen.get("source_type"),
+        "trust_level": chosen.get("trust_level"),
+        "is_official": bool(chosen.get("is_official")),
+        "source_url": url,
+        "source_title": title,
+        "published_date": published_date,
+    }
+
+
+def build_closest_severe_payload(closest_severe: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if closest_severe is None:
+        return None
+
+    primary_source = select_primary_source_for_incident(closest_severe)
+
+    payload = {
+        "incident_id": closest_severe.get("id"),
+        "incident_type": closest_severe.get("incident_type"),
+        "incident_label": incident_label(closest_severe.get("incident_type")),
+        "distance_m": round(safe_float(closest_severe.get("distance_m"), 0.0), 1),
+        "distance_text": format_distance(closest_severe.get("distance_m")),
+        "days_ago": closest_severe.get("days_ago"),
+        "city": closest_severe.get("city"),
+        "county": closest_severe.get("county"),
+        "title": closest_severe.get("title"),
+        "summary": closest_severe.get("summary"),
+        "latitude": closest_severe.get("latitude"),
+        "longitude": closest_severe.get("longitude"),
+        "published_date": closest_severe.get("published_date"),
+        "official_confirmation": False,
+        "primary_source_name": None,
+        "primary_source_type": None,
+        "primary_source_url": None,
+        "primary_source_title": None,
+    }
+
+    if primary_source:
+        payload["official_confirmation"] = bool(primary_source.get("is_official"))
+        payload["primary_source_name"] = primary_source.get("source_name")
+        payload["primary_source_type"] = primary_source.get("source_type")
+        payload["primary_source_url"] = primary_source.get("source_url")
+        payload["primary_source_title"] = primary_source.get("source_title")
+
+        if not payload["published_date"]:
+            payload["published_date"] = primary_source.get("published_date")
+
+    return payload
+
+
 def build_reason_message(
     counts: dict[str, int],
     closest_severe: Optional[dict[str, Any]],
+    closest_severe_payload: Optional[dict[str, Any]],
     nearby_geo_incidents: list[dict[str, Any]],
     lookback_days: int,
     confidence: float,
@@ -659,9 +798,15 @@ def build_reason_message(
             else:
                 time_text = f"în ultimele {lookback_days} zile"
 
+        source_part = ""
+        if closest_severe_payload and closest_severe_payload.get("official_confirmation"):
+            source_name = closest_severe_payload.get("primary_source_name")
+            if source_name:
+                source_part = f" Confirmare oficială: {source_name}."
+
         return (
             f"La aproximativ {distance_text} de această locație a fost raportat "
-            f"un caz de {label} {time_text}."
+            f"un caz de {label} {time_text}.{source_part}"
         )
 
     if severe_count > 0:
@@ -778,20 +923,6 @@ def build_ui_message(level: str, base_reason: str, confidence: float) -> str:
     )
 
 
-def normalize_score_to_ten(raw_score: float) -> float:
-    """
-    Transformă scorul brut într-o scară 0–10.
-    Funcția logaritmică:
-    - evită scoruri 0 când există risc real,
-    - evită saturarea prea rapidă la 10 în zonele urbane dense.
-    """
-    if raw_score <= 0:
-        return 0.0
-
-    normalized = 10.0 * (1 - math.exp(-raw_score / 24.0))
-    return round(clamp(normalized, 0.0, 10.0), 1)
-
-
 def get_heatmap_points(
     center_lat: float,
     center_lng: float,
@@ -841,6 +972,7 @@ def evaluate_risk(
             "incidents_summary": empty_counts(),
             "score_internal": 0.0,
             "confidence": 0.20,
+            "closest_severe_incident": None,
             "meta": {
                 "county": None,
                 "city": None,
@@ -885,6 +1017,7 @@ def evaluate_risk(
         if item.get("incident_type") in SEVERE_INCIDENT_TYPES
     ]
     closest_severe = find_closest_severe_incident(nearby_geo_incidents)
+    closest_severe_payload = build_closest_severe_payload(closest_severe)
 
     if not profile and not incidents_area_enriched and not nearby_geo_incidents:
         return {
@@ -893,6 +1026,7 @@ def evaluate_risk(
             "incidents_summary": counts,
             "score_internal": 0.0,
             "confidence": 0.18,
+            "closest_severe_incident": None,
             "meta": {
                 "county": county_n,
                 "city": city_n,
@@ -999,27 +1133,12 @@ def evaluate_risk(
     base_reason = build_reason_message(
         counts=counts,
         closest_severe=closest_severe,
+        closest_severe_payload=closest_severe_payload,
         nearby_geo_incidents=nearby_geo_incidents,
         lookback_days=lookback_days,
         confidence=confidence,
     )
     message = build_ui_message(level, base_reason, confidence)
-
-    closest_severe_payload = None
-    if closest_severe is not None:
-        closest_severe_payload = {
-            "incident_type": closest_severe.get("incident_type"),
-            "incident_label": incident_label(closest_severe.get("incident_type")),
-            "distance_m": round(safe_float(closest_severe.get("distance_m"), 0.0), 1),
-            "distance_text": format_distance(closest_severe.get("distance_m")),
-            "days_ago": closest_severe.get("days_ago"),
-            "city": closest_severe.get("city"),
-            "county": closest_severe.get("county"),
-            "title": closest_severe.get("title"),
-            "summary": closest_severe.get("summary"),
-            "latitude": closest_severe.get("latitude"),
-            "longitude": closest_severe.get("longitude"),
-        }
 
     severe_count, moderate_count = summarize_severity_groups(counts)
 
@@ -1029,6 +1148,7 @@ def evaluate_risk(
         "incidents_summary": counts,
         "score_internal": score_0_10,
         "confidence": confidence,
+        "closest_severe_incident": closest_severe_payload,
         "meta": {
             "county": county_n,
             "city": city_n,
