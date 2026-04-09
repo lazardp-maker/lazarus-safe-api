@@ -25,13 +25,14 @@ from app.risk_engine import (
 from app.schemas import AnalyzeRequest, AnalyzeResponse
 
 APP_NAME = "Lazarus Safe API"
-APP_VERSION = os.getenv("APP_VERSION", "3.3.1")
+APP_VERSION = os.getenv("APP_VERSION", "3.4.0")
 APP_ENV = os.getenv("APP_ENV", "development")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 GEOCODER_TIMEOUT_SECONDS = int(os.getenv("GEOCODER_TIMEOUT_SECONDS", "10"))
 
 logger = logging.getLogger(APP_NAME)
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=LOG_LEVEL,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
@@ -55,13 +56,6 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup_event() -> None:
-    """
-    Startup minimalist și sigur:
-    - inițializează baza de date
-    - validează tabelele critice
-    - loghează informații utile
-    NU rulează scraping, seed sau alte joburi grele.
-    """
     logger.info("startup.begin env=%s version=%s", APP_ENV, APP_VERSION)
 
     try:
@@ -120,6 +114,8 @@ def canonicalize_place(value: Optional[str]) -> Optional[str]:
         "orasul ",
         "oras ",
         "comuna ",
+        "satul ",
+        "localitatea ",
         "county of ",
         "county ",
     ]
@@ -131,20 +127,35 @@ def canonicalize_place(value: Optional[str]) -> Optional[str]:
     aliases = {
         "bucharest": "bucuresti",
         "municipiul bucuresti": "bucuresti",
-        "sector 1": "bucuresti",
-        "sector 2": "bucuresti",
-        "sector 3": "bucuresti",
-        "sector 4": "bucuresti",
-        "sector 5": "bucuresti",
-        "sector 6": "bucuresti",
+        "orasul bucuresti": "bucuresti",
+        "sector 1": "sector 1",
+        "sector 2": "sector 2",
+        "sector 3": "sector 3",
+        "sector 4": "sector 4",
+        "sector 5": "sector 5",
+        "sector 6": "sector 6",
         "cluj napoca": "cluj-napoca",
         "tirgu mures": "targu mures",
     }
 
-    return aliases.get(value, value)
+    value = aliases.get(value, value)
+
+    if value in {"sector 1", "sector 2", "sector 3", "sector 4", "sector 5", "sector 6"}:
+        return value
+
+    return value
+
+
+def validate_coordinates(lat: float, lng: float) -> None:
+    if not (-90 <= lat <= 90):
+        raise HTTPException(status_code=422, detail="Latitudine invalidă.")
+    if not (-180 <= lng <= 180):
+        raise HTTPException(status_code=422, detail="Longitudine invalidă.")
 
 
 def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optional[str]]:
+    validate_coordinates(lat, lng)
+
     url = "https://nominatim.openstreetmap.org/reverse"
     headers = {
         "User-Agent": f"LazarusSafeApp/{APP_VERSION} (contact: lazardp@gmail.com)",
@@ -183,12 +194,16 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
             or address.get("village")
             or address.get("suburb")
             or address.get("city_district")
+            or address.get("borough")
         )
 
         county = canonicalize_place(raw_county)
         city = canonicalize_place(raw_city)
 
-        if county == "bucuresti":
+        if city in {"sector 1", "sector 2", "sector 3", "sector 4", "sector 5", "sector 6"}:
+            county = "bucuresti"
+
+        if county == "bucuresti" and not city:
             city = "bucuresti"
 
         logger.info(
@@ -212,6 +227,7 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
             exc,
         )
 
+    # fallback minimal
     if 44.3 <= lat <= 44.6 and 25.9 <= lng <= 26.3:
         return "bucuresti", "bucuresti"
 
@@ -249,7 +265,12 @@ def incidents_summary_to_dict(value: Any) -> dict[str, int]:
         return empty_incidents_summary()
 
     default_summary = empty_incidents_summary()
-    default_summary.update(summary)
+    for key, val in summary.items():
+        try:
+            default_summary[key] = int(val)
+        except Exception:
+            continue
+
     return default_summary
 
 
@@ -339,9 +360,9 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
             result.get("incidents_summary", empty_incidents_summary())
         ),
         sources_used=sources_used if isinstance(sources_used, list) else [],
-        confidence=result.get("confidence", 0.0),
+        confidence=float(result.get("confidence", 0.0) or 0.0),
         analyzed_at=analyzed_at,
-        debug=result.get("meta"),
+        debug=result.get("meta") if isinstance(result.get("meta"), dict) else {},
     )
 
 
@@ -362,6 +383,9 @@ def health() -> dict[str, Any]:
         cursor.execute("SELECT COUNT(*) AS total FROM articles")
         articles_total = cursor.fetchone()["total"]
 
+        cursor.execute("SELECT COUNT(*) AS total FROM incidents WHERE latitude IS NOT NULL AND longitude IS NOT NULL")
+        geo_incidents_total = cursor.fetchone()["total"]
+
     return {
         "status": "ok",
         "service": APP_NAME,
@@ -372,6 +396,7 @@ def health() -> dict[str, Any]:
             "sources": sources_total,
             "area_risk_profiles": profiles_total,
             "incidents": incidents_total,
+            "geo_coded_incidents": geo_incidents_total,
             "articles": articles_total,
         },
     }
@@ -388,6 +413,7 @@ def ready() -> dict[str, Any]:
             "area_risk_profiles",
             "incidents",
             "articles",
+            "incident_mentions",
         }
         missing_tables = sorted(required_tables - set(tables))
 
@@ -446,6 +472,9 @@ def admin_db_summary() -> dict[str, Any]:
         cursor.execute("SELECT COUNT(*) AS total FROM area_risk_profiles")
         profiles_total = cursor.fetchone()["total"]
 
+        cursor.execute("SELECT COUNT(*) AS total FROM incidents WHERE latitude IS NOT NULL AND longitude IS NOT NULL")
+        geo_incidents_total = cursor.fetchone()["total"]
+
         cursor.execute(
             """
             SELECT verification_status, COUNT(*) AS total
@@ -472,6 +501,21 @@ def admin_db_summary() -> dict[str, Any]:
             for row in cursor.fetchall()
         ]
 
+        cursor.execute(
+            """
+            SELECT county, COUNT(*) AS total
+            FROM incidents
+            WHERE county IS NOT NULL AND county <> ''
+            GROUP BY county
+            ORDER BY total DESC
+            LIMIT 20
+            """
+        )
+        by_county = [
+            {"county": row["county"], "total": row["total"]}
+            for row in cursor.fetchall()
+        ]
+
     return {
         "db_path": get_db_path(),
         "totals": {
@@ -480,9 +524,11 @@ def admin_db_summary() -> dict[str, Any]:
             "incidents": incidents_total,
             "incident_mentions": mentions_total,
             "area_risk_profiles": profiles_total,
+            "geo_coded_incidents": geo_incidents_total,
         },
         "incidents_by_verification_status": by_verification,
         "incidents_by_type": by_type,
+        "incidents_by_county": by_county,
     }
 
 
@@ -491,6 +537,7 @@ def admin_recent_incidents(
     limit: int = Query(default=20, ge=1, le=100),
     county: Optional[str] = Query(default=None),
     city: Optional[str] = Query(default=None),
+    only_geocoded: bool = Query(default=False),
 ) -> dict[str, Any]:
     county_n = canonicalize_place(county) if county else None
     city_n = canonicalize_place(city) if city else None
@@ -506,6 +553,9 @@ def admin_recent_incidents(
         where_parts.append("city = ?")
         params.append(city_n)
 
+    if only_geocoded:
+        where_parts.append("latitude IS NOT NULL AND longitude IS NOT NULL")
+
     where_sql = " AND ".join(where_parts)
 
     query = f"""
@@ -519,8 +569,13 @@ def admin_recent_incidents(
             event_date,
             published_date,
             days_ago,
+            address_text,
+            location_text,
             city,
             county,
+            latitude,
+            longitude,
+            geo_confidence,
             ai_confidence,
             is_verified,
             verification_status,
@@ -553,8 +608,13 @@ def admin_recent_incidents(
                 "event_date": row["event_date"],
                 "published_date": row["published_date"],
                 "days_ago": row["days_ago"],
+                "address_text": row["address_text"],
+                "location_text": row["location_text"],
                 "city": row["city"],
                 "county": row["county"],
+                "latitude": row["latitude"],
+                "longitude": row["longitude"],
+                "geo_confidence": row["geo_confidence"],
                 "ai_confidence": row["ai_confidence"],
                 "is_verified": row["is_verified"],
                 "verification_status": row["verification_status"],
@@ -569,6 +629,7 @@ def admin_recent_incidents(
             "county": county_n,
             "city": city_n,
             "limit": limit,
+            "only_geocoded": only_geocoded,
         },
         "items": incidents,
     }
@@ -576,10 +637,6 @@ def admin_recent_incidents(
 
 @app.post("/admin/run-collector")
 def admin_run_collector() -> dict[str, str]:
-    """
-    Rulează collectorul manual, la cerere.
-    Importul collectorului este lazy și se face doar când endpoint-ul este apelat.
-    """
     try:
         logger.info("collector.manual_run.begin")
         from app.collectors.collector_real import main as run_collector
@@ -600,11 +657,13 @@ def admin_run_collector() -> dict[str, str]:
 
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
+    validate_coordinates(payload.lat, payload.lng)
     return build_analysis_response(payload)
 
 
 @app.post("/location-risk", response_model=AnalyzeResponse)
 def location_risk(payload: AnalyzeRequest) -> AnalyzeResponse:
+    validate_coordinates(payload.lat, payload.lng)
     return build_analysis_response(payload)
 
 
@@ -613,6 +672,8 @@ def get_risk(
     lat: float = Query(..., description="Latitudine"),
     lng: float = Query(..., description="Longitudine"),
 ) -> dict[str, Any]:
+    validate_coordinates(lat, lng)
+
     payload = AnalyzeRequest(lat=lat, lng=lng)
     result = build_analysis_response(payload)
 
@@ -624,6 +685,9 @@ def get_risk(
     confidence_raw = float(result.confidence) if result.confidence is not None else 0.0
     confidence_percent = round(confidence_raw * 100.0, 1)
 
+    debug = result.debug if isinstance(result.debug, dict) else {}
+    closest_severe = debug.get("closest_severe_incident")
+
     return {
         "risk_level": result.level,
         "message": result.message,
@@ -634,8 +698,9 @@ def get_risk(
         "incidents_summary": summary_dict,
         "incidents_count": total_incidents,
         "sources_used": result.sources_used,
+        "closest_severe_incident": closest_severe,
         "analyzed_at": result.analyzed_at,
-        "debug": result.debug,
+        "debug": debug,
     }
 
 
@@ -646,6 +711,8 @@ def heatmap(
     radius_m: int = Query(default=10000, ge=200, le=20000, description="Rază în metri"),
     lookback_days: int = Query(default=365, ge=1, le=365, description="Fereastră analiză"),
 ) -> dict[str, Any]:
+    validate_coordinates(lat, lng)
+
     try:
         points = get_heatmap_points(
             center_lat=lat,
@@ -694,9 +761,7 @@ def home() -> str:
         />
 
         <style>
-            * {
-                box-sizing: border-box;
-            }
+            * { box-sizing: border-box; }
 
             body {
                 margin: 0;
@@ -715,7 +780,7 @@ def home() -> str:
                 top: 20px;
                 left: 20px;
                 z-index: 1000;
-                width: 395px;
+                width: 410px;
                 max-width: calc(100% - 40px);
                 background: rgba(15, 31, 74, 0.96);
                 border-radius: 18px;
@@ -728,7 +793,6 @@ def home() -> str:
                 margin: 0 0 6px 0;
                 font-size: 24px;
                 font-weight: 700;
-                letter-spacing: 0.3px;
             }
 
             .subtitle {
@@ -756,26 +820,11 @@ def home() -> str:
                 transition: 0.2s ease;
             }
 
-            button:hover {
-                transform: translateY(-1px);
-            }
+            button:hover { transform: translateY(-1px); }
 
-            .btn-primary {
-                background: #ffffff;
-                color: #0b1736;
-            }
-
-            .btn-secondary {
-                background: #1f3776;
-                color: #ffffff;
-                border: 1px solid rgba(255,255,255,0.12);
-            }
-
-            .btn-ghost {
-                background: #162a60;
-                color: #ffffff;
-                border: 1px solid rgba(255,255,255,0.08);
-            }
+            .btn-primary { background: #ffffff; color: #0b1736; }
+            .btn-secondary { background: #1f3776; color: #ffffff; }
+            .btn-ghost { background: #162a60; color: #ffffff; }
 
             .status {
                 margin-top: 6px;
@@ -798,25 +847,10 @@ def home() -> str:
                 letter-spacing: 0.3px;
             }
 
-            .risk-low {
-                background: rgba(46, 204, 113, 0.18);
-                color: #7CFFB2;
-            }
-
-            .risk-medium {
-                background: rgba(241, 196, 15, 0.18);
-                color: #FFD95B;
-            }
-
-            .risk-high {
-                background: rgba(231, 76, 60, 0.18);
-                color: #FF8E82;
-            }
-
-            .risk-unknown {
-                background: rgba(255,255,255,0.12);
-                color: #ECECEC;
-            }
+            .risk-low { background: rgba(46, 204, 113, 0.18); color: #7CFFB2; }
+            .risk-medium { background: rgba(241, 196, 15, 0.18); color: #FFD95B; }
+            .risk-high { background: rgba(231, 76, 60, 0.18); color: #FF8E82; }
+            .risk-unknown { background: rgba(255,255,255,0.12); color: #ECECEC; }
 
             .muted {
                 color: #b7c8ef;
@@ -842,6 +876,14 @@ def home() -> str:
                 margin-top: 10px;
                 font-size: 12px;
                 color: #9fb1e8;
+            }
+
+            .closest-alert {
+                margin-top: 10px;
+                padding: 10px;
+                border-radius: 10px;
+                background: rgba(231, 76, 60, 0.14);
+                border: 1px solid rgba(231, 76, 60, 0.25);
             }
 
             code {
@@ -932,9 +974,7 @@ def home() -> str:
 
                 if (heatCircles.length) {
                     heatCircles.forEach(layer => {
-                        try {
-                            map.removeLayer(layer);
-                        } catch (e) {}
+                        try { map.removeLayer(layer); } catch (e) {}
                     });
                     heatCircles = [];
                 }
@@ -982,27 +1022,21 @@ def home() -> str:
                     value.includes("SAFE") ||
                     value.includes("SCAZUT") ||
                     value.includes("STABILA")
-                ) {
-                    return "risk-low";
-                }
+                ) return "risk-low";
 
                 if (
                     value.includes("MED") ||
                     value.includes("MODERAT") ||
                     value === "PRUDENȚĂ" ||
                     value === "PRUDENTA"
-                ) {
-                    return "risk-medium";
-                }
+                ) return "risk-medium";
 
                 if (
                     value.includes("HIGH") ||
                     value.includes("RIDICAT") ||
                     value.includes("SEVER") ||
                     value.includes("SERIOASA")
-                ) {
-                    return "risk-high";
-                }
+                ) return "risk-high";
 
                 return "risk-unknown";
             }
@@ -1035,6 +1069,21 @@ def home() -> str:
                 return `<ul class="small-list">${items.join("")}</ul>`;
             }
 
+            function buildClosestSevere(data) {
+                const item = data.closest_severe_incident;
+                if (!item) return "";
+
+                return `
+                    <div class="closest-alert">
+                        <div><strong>Incident grav apropiat</strong></div>
+                        <div class="muted">Tip: ${item.incident_label || item.incident_type || "-"}</div>
+                        <div class="muted">Distanță: ${item.distance_text || "-"}</div>
+                        <div class="muted">Zonă: ${item.city || "-"}${item.county ? ", " + item.county : ""}</div>
+                        <div class="muted">Titlu: ${item.title || "-"}</div>
+                    </div>
+                `;
+            }
+
             async function checkRisk() {
                 if (selectedLat === null || selectedLng === null) {
                     alert("Selectează mai întâi o locație.");
@@ -1046,7 +1095,6 @@ def home() -> str:
 
                 try {
                     const response = await fetch(`/risk?lat=${selectedLat}&lng=${selectedLng}`);
-
                     if (!response.ok) {
                         throw new Error(`HTTP ${response.status}`);
                     }
@@ -1068,7 +1116,9 @@ def home() -> str:
                             ${data.message || "Nu există mesaj disponibil."}
                         </p>
 
-                        <div class="muted">
+                        ${buildClosestSevere(data)}
+
+                        <div class="muted" style="margin-top:8px;">
                             Confidence: ${Number(data.confidence_percent || 0).toFixed(1)}%
                         </div>
 
@@ -1110,8 +1160,6 @@ def home() -> str:
                 }
 
                 const data = await response.json();
-                console.log("HEATMAP RESPONSE:", data);
-
                 clearHeatmapLayers();
 
                 if (!data.points || !data.points.length) {
