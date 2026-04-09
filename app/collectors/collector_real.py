@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -22,6 +23,10 @@ MIN_TITLE_LEN = 18
 MIN_CONTENT_LEN = 120
 MIN_AI_CONFIDENCE = 0.62
 
+MATCH_LOOKBACK_DAYS = 7
+MATCH_SCORE_THRESHOLD = 0.62
+MAX_TITLE_TOKENS = 12
+
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 LazarusSafeCollector/3.2",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -41,6 +46,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 _geocode_cache: dict[str, Optional[tuple[float, float, float, str]]] = {}
+
+STOP_TOKENS = {
+    "in", "din", "la", "pe", "cu", "de", "si", "și", "un", "o", "a", "au",
+    "dintr", "dintr-o", "dintrun", "dintre", "sau", "pentru", "care", "catre",
+    "către", "asupra", "caz", "cazul", "privind", "dupa", "după", "ultimele",
+    "zile", "luni", "azi", "ieri", "maine", "mâine", "politistii", "polițiștii",
+    "politia", "poliția", "arges", "argeș", "bucuresti", "bucurești"
+}
 
 
 @dataclass
@@ -116,6 +129,55 @@ NOISE_KEYWORDS = [
 
 def clean_text(text: str) -> str:
     return " ".join(text.split()).strip()
+
+
+def safe_float(value, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    import math
+
+    radius = 6371000.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lng2 - lng1)
+
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * radius * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def normalize_for_match(value: Optional[str]) -> str:
+    return normalize_text(value) or ""
+
+
+def tokenize_title(value: Optional[str]) -> set[str]:
+    text = normalize_for_match(value)
+    tokens = re.findall(r"[a-z0-9]{3,}", text)
+    cleaned = [t for t in tokens if t not in STOP_TOKENS]
+    return set(cleaned[:MAX_TITLE_TOKENS])
+
+
+def jaccard_similarity(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    if union == 0:
+        return 0.0
+    return inter / union
+
+
+def is_official_source_name(name: Optional[str]) -> bool:
+    value = normalize_for_match(name)
+    tokens = ("politia", "ipj", "mai", "isu", "igsu", "dsu", "parchet", "diicot", "jandarmeria")
+    return any(token in value for token in tokens)
 
 
 def get_active_sources() -> list[SourceItem]:
@@ -479,6 +541,165 @@ def get_incident_id_by_uid(conn, incident_uid: str) -> Optional[int]:
     return row["id"] if row else None
 
 
+def get_recent_candidate_incidents_for_match(conn, parsed: dict, source: SourceItem) -> list[dict]:
+    incident_type = parsed.get("incident_type")
+    county = parsed.get("county") or source.county
+    city = parsed.get("city") or source.city
+    published_date = parsed.get("published_date")
+
+    if not incident_type or not county:
+        return []
+
+    where_parts = [
+        "incident_type = ?",
+        "county = ?",
+        "date(COALESCE(event_date, published_date, created_at)) >= date('now', ?)",
+    ]
+    params: list[object] = [incident_type, county, f"-{MATCH_LOOKBACK_DAYS} days"]
+
+    if city:
+        where_parts.append("(city = ? OR city IS NULL OR city = '')")
+        params.append(city)
+
+    if published_date:
+        where_parts.append(
+            "ABS(julianday(COALESCE(event_date, published_date, created_at)) - julianday(?)) <= 3"
+        )
+        params.append(published_date)
+
+    query = f"""
+        SELECT
+            id,
+            incident_uid,
+            incident_type,
+            severity_level,
+            title,
+            summary,
+            event_date,
+            published_date,
+            days_ago,
+            address_text,
+            location_text,
+            city,
+            county,
+            latitude,
+            longitude,
+            geo_confidence,
+            ai_confidence,
+            is_verified,
+            verification_status,
+            source_priority,
+            duplicate_group_id,
+            primary_source_id,
+            article_id,
+            created_at
+        FROM incidents
+        WHERE {" AND ".join(where_parts)}
+        ORDER BY COALESCE(date(event_date), date(published_date), date(created_at)) DESC, id DESC
+        LIMIT 25
+    """
+
+    cursor = conn.cursor()
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    return [dict(row) for row in rows]
+
+
+def compute_incident_match_score(existing: dict, parsed: dict, source: SourceItem) -> float:
+    score = 0.0
+
+    existing_type = normalize_for_match(existing.get("incident_type"))
+    parsed_type = normalize_for_match(parsed.get("incident_type"))
+    if existing_type != parsed_type:
+        return 0.0
+    score += 0.22
+
+    existing_county = normalize_for_match(existing.get("county"))
+    parsed_county = normalize_for_match(parsed.get("county") or source.county)
+    if existing_county and parsed_county and existing_county == parsed_county:
+        score += 0.14
+    elif existing_county or parsed_county:
+        return 0.0
+
+    existing_city = normalize_for_match(existing.get("city"))
+    parsed_city = normalize_for_match(parsed.get("city") or source.city)
+    if existing_city and parsed_city and existing_city == parsed_city:
+        score += 0.10
+    elif not existing_city or not parsed_city:
+        score += 0.03
+
+    existing_date = normalize_for_match(existing.get("published_date") or existing.get("event_date"))
+    parsed_date = normalize_for_match(parsed.get("published_date"))
+    if existing_date and parsed_date:
+        if existing_date == parsed_date:
+            score += 0.16
+        else:
+            score += 0.04
+
+    existing_location = normalize_for_match(existing.get("location_text") or existing.get("address_text"))
+    parsed_location = normalize_for_match(parsed.get("location_text") or parsed.get("address_text"))
+    if existing_location and parsed_location:
+        if existing_location == parsed_location:
+            score += 0.18
+        elif existing_location in parsed_location or parsed_location in existing_location:
+            score += 0.12
+
+    existing_title_tokens = tokenize_title(existing.get("title"))
+    parsed_title_tokens = tokenize_title(parsed.get("title"))
+    title_sim = jaccard_similarity(existing_title_tokens, parsed_title_tokens)
+    score += min(title_sim * 0.22, 0.22)
+
+    existing_lat = safe_float(existing.get("latitude"))
+    existing_lng = safe_float(existing.get("longitude"))
+    parsed_lat = safe_float(parsed.get("latitude"))
+    parsed_lng = safe_float(parsed.get("longitude"))
+
+    if None not in (existing_lat, existing_lng, parsed_lat, parsed_lng):
+        try:
+            dist = haversine_meters(existing_lat, existing_lng, parsed_lat, parsed_lng)
+            if dist <= 120:
+                score += 0.24
+            elif dist <= 350:
+                score += 0.18
+            elif dist <= 800:
+                score += 0.10
+        except Exception:
+            pass
+
+    existing_verified = int(existing.get("is_verified") or 0)
+    new_is_official = bool(source.source_type == "official" or is_official_source_name(source.name))
+    if existing_verified == 1 or new_is_official:
+        score += 0.03
+
+    return min(score, 1.0)
+
+
+def find_matching_incident(conn, parsed: dict, source: SourceItem) -> Optional[int]:
+    candidates = get_recent_candidate_incidents_for_match(conn, parsed, source)
+    if not candidates:
+        return None
+
+    best_id: Optional[int] = None
+    best_score = 0.0
+
+    for candidate in candidates:
+        score = compute_incident_match_score(candidate, parsed, source)
+        if score > best_score:
+            best_score = score
+            best_id = candidate["id"]
+
+    if best_id is not None and best_score >= MATCH_SCORE_THRESHOLD:
+        logger.info(
+            "MATCH incident existent | incident_id=%s | score=%.3f | titlu=%s",
+            best_id,
+            best_score,
+            parsed.get("title"),
+        )
+        return best_id
+
+    return None
+
+
 def update_existing_incident_geo_if_better(
     conn,
     incident_id: int,
@@ -497,7 +718,9 @@ def update_existing_incident_geo_if_better(
             geo_confidence,
             ai_confidence,
             verification_status,
-            is_verified
+            is_verified,
+            primary_source_id,
+            source_priority
         FROM incidents
         WHERE id = ?
         LIMIT 1
@@ -526,6 +749,9 @@ def update_existing_incident_geo_if_better(
             if new_conf > existing_conf:
                 should_update_geo = True
 
+    new_is_official = bool(source.source_type == "official" or parsed.get("is_verified") == 1)
+    new_priority = max(int(source.trust_level or 3), int(row["source_priority"] or 3))
+
     cursor.execute(
         """
         UPDATE incidents
@@ -547,8 +773,18 @@ def update_existing_incident_geo_if_better(
                 ELSE is_verified
             END,
             verification_status = CASE
-                WHEN ? = 1 THEN ?
+                WHEN ? = 1 THEN 'verified'
+                WHEN verification_status = 'unverified' AND ? IS NOT NULL THEN ?
                 ELSE verification_status
+            END,
+            source_priority = CASE
+                WHEN ? > source_priority THEN ?
+                ELSE source_priority
+            END,
+            primary_source_id = CASE
+                WHEN ? = 1 THEN ?
+                WHEN primary_source_id IS NULL THEN ?
+                ELSE primary_source_id
             END
         WHERE id = ?
         """,
@@ -569,6 +805,13 @@ def update_existing_incident_geo_if_better(
             parsed.get("is_verified"),
             parsed.get("is_verified"),
             parsed.get("verification_status"),
+            parsed.get("verification_status"),
+            parsed.get("verification_status"),
+            new_priority,
+            new_priority,
+            1 if new_is_official else 0,
+            source.id,
+            source.id,
             incident_id,
         ),
     )
@@ -607,21 +850,7 @@ def save_incident_mention(
     )
 
 
-def save_incident(conn, source: SourceItem, article_id: int, parsed: dict) -> tuple[int, bool]:
-    incident_id = get_incident_id_by_uid(conn, parsed["incident_uid"])
-    if incident_id:
-        update_existing_incident_geo_if_better(conn, incident_id, parsed, source)
-        save_incident_mention(
-            conn=conn,
-            incident_id=incident_id,
-            source=source,
-            article_id=article_id,
-            mention_title=parsed["title"],
-            mention_url=parsed["url"],
-            published_date=parsed["published_date"],
-        )
-        return incident_id, False
-
+def save_new_incident(conn, source: SourceItem, article_id: int, parsed: dict) -> int:
     county_value = parsed["county"] or source.county
     city_value = parsed["city"] or source.city
     location_text_value = parsed.get("location_text")
@@ -682,7 +911,28 @@ def save_incident(conn, source: SourceItem, article_id: int, parsed: dict) -> tu
         ),
     )
 
-    incident_id = cursor.lastrowid
+    return cursor.lastrowid
+
+
+def save_incident(conn, source: SourceItem, article_id: int, parsed: dict) -> tuple[int, bool]:
+    incident_id = get_incident_id_by_uid(conn, parsed["incident_uid"])
+    if not incident_id:
+        incident_id = find_matching_incident(conn, parsed, source)
+
+    if incident_id:
+        update_existing_incident_geo_if_better(conn, incident_id, parsed, source)
+        save_incident_mention(
+            conn=conn,
+            incident_id=incident_id,
+            source=source,
+            article_id=article_id,
+            mention_title=parsed["title"],
+            mention_url=parsed["url"],
+            published_date=parsed["published_date"],
+        )
+        return incident_id, False
+
+    incident_id = save_new_incident(conn, source, article_id, parsed)
     save_incident_mention(
         conn=conn,
         incident_id=incident_id,
