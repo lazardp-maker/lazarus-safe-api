@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from math import asin, cos, radians, sin, sqrt
 from typing import Any, Optional
@@ -12,9 +13,10 @@ from app.db import get_connection, initialize_database
 from app.risk_engine import evaluate_risk, get_heatmap_points
 
 
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.4.0"
 DEFAULT_LOOKBACK_DAYS = 120
 DEFAULT_RADIUS_M = 10000
+MAX_SERIOUS_SCAN_LIMIT = 300
 
 SERIOUS_TYPES = {
     "homicide",
@@ -22,11 +24,37 @@ SERIOUS_TYPES = {
     "robbery",
 }
 
+INCIDENT_TYPE_LABELS = {
+    "homicide": "Omor",
+    "sexual_violence": "Violență sexuală",
+    "robbery": "Tâlhărie",
+    "violence": "Violență",
+    "theft": "Furt",
+    "traffic": "Eveniment rutier",
+    "emergency": "Urgență",
+    "public_order": "Ordine publică",
+    "general": "Eveniment raportat",
+}
+
+RISK_LEVEL_LABELS = {
+    "very_low": "Situație stabilă",
+    "low": "Prudență",
+    "medium": "Prudență ridicată",
+    "high": "Atenționare serioasă",
+}
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    initialize_database()
+    yield
+
 
 app = FastAPI(
     title="Lazarus Safe API",
     version=APP_VERSION,
     description="Geospatial risk intelligence backend for Lazarus Safe",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -42,6 +70,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(value, maximum))
+
+
 def haversine_meters(
     lat1: float,
     lng1: float,
@@ -51,23 +83,35 @@ def haversine_meters(
     if lat2 is None or lng2 is None:
         return None
 
-    r = 6371000
+    earth_radius_m = 6371000
     p1 = radians(lat1)
     p2 = radians(lat2)
-    dp = radians(lat2 - lat1)
-    dl = radians(lng2 - lng1)
+    delta_phi = radians(lat2 - lat1)
+    delta_lambda = radians(lng2 - lng1)
 
-    a = sin(dp / 2) ** 2 + cos(p1) * cos(p2) * sin(dl / 2) ** 2
+    a = (
+        sin(delta_phi / 2) ** 2
+        + cos(p1) * cos(p2) * sin(delta_lambda / 2) ** 2
+    )
     c = 2 * asin(sqrt(a))
-    return round(r * c, 1)
+    return round(earth_radius_m * c, 1)
 
 
-def safe_float(value: Any) -> Optional[float]:
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_optional_float(value: Any) -> Optional[float]:
     try:
         if value is None:
             return None
         return float(value)
-    except Exception:
+    except (TypeError, ValueError):
         return None
 
 
@@ -76,8 +120,17 @@ def safe_int(value: Any, default: int = 0) -> int:
         if value is None:
             return default
         return int(value)
-    except Exception:
+    except (TypeError, ValueError):
         return default
+
+
+def safe_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    return text in {"1", "true", "yes", "da", "verified", "oficial"}
 
 
 def row_to_dict(row: Any) -> dict[str, Any]:
@@ -100,12 +153,47 @@ def column_or_null(columns: set[str], column: str, alias: Optional[str] = None) 
     return f"NULL AS {alias_name}"
 
 
-def build_source_label(row: dict[str, Any]) -> str:
-    for key in ["source_name", "source", "source_title", "publisher"]:
+def first_value(row: dict[str, Any], keys: tuple[str, ...]) -> Optional[str]:
+    for key in keys:
         value = row.get(key)
         if value:
-            return str(value)
-    return "Sursă necunoscută"
+            return str(value).strip()
+    return None
+
+
+def build_source_label(row: dict[str, Any]) -> str:
+    return first_value(row, ("source_name", "source", "source_title", "publisher")) or "Sursă necunoscută"
+
+
+def build_source_url(row: dict[str, Any]) -> Optional[str]:
+    return first_value(row, ("source_url", "article_url", "url"))
+
+
+def build_location_label(row: dict[str, Any]) -> str:
+    city = first_value(row, ("city", "locality", "town"))
+    county = first_value(row, ("county", "judet"))
+
+    if city and county:
+        return f"{city}, {county}"
+    if city:
+        return city
+    if county:
+        return county
+    return "Localitate neprecizată"
+
+
+def build_distance_text(distance_m: Optional[float]) -> str:
+    if distance_m is None:
+        return "Distanță indisponibilă"
+    if distance_m < 1000:
+        return f"aprox. {round(distance_m)} m"
+    return f"aprox. {round(distance_m / 1000, 1)} km"
+
+
+def incident_type_label(incident_type: Optional[str]) -> str:
+    if not incident_type:
+        return "Eveniment raportat"
+    return INCIDENT_TYPE_LABELS.get(incident_type, incident_type.replace("_", " ").title())
 
 
 def classify_risk_level(score: float) -> str:
@@ -118,34 +206,41 @@ def classify_risk_level(score: float) -> str:
     return "very_low"
 
 
-def human_message(score: float, serious_count: int, nearest_serious: Optional[dict[str, Any]]) -> str:
+def risk_badge(score: float) -> str:
+    level = classify_risk_level(score)
+    label = RISK_LEVEL_LABELS.get(level, "Situație analizată")
+    return f"{label} · {score:.1f}/10"
+
+
+def human_message(
+    score: float,
+    nearest_serious: Optional[dict[str, Any]],
+) -> str:
     if nearest_serious:
         incident_type = nearest_serious.get("incident_type")
-        distance_m = nearest_serious.get("distance_m")
-        city = nearest_serious.get("city") or nearest_serious.get("county") or "zona analizată"
+        display_type = incident_type_label(incident_type)
+        distance_text = nearest_serious.get("distance_text") or "în proximitatea zonei analizate"
+        location_label = nearest_serious.get("location_label") or "zona analizată"
 
-        if distance_m is not None:
-            distance_text = (
-                f"la aproximativ {round(distance_m)} metri"
-                if distance_m < 1000
-                else f"la aproximativ {round(distance_m / 1000, 1)} km"
+        if incident_type in {"homicide", "sexual_violence"}:
+            return (
+                f"Atenție: există un incident grav de tip {display_type.lower()} raportat "
+                f"{distance_text}, în zona {location_label}. Recomandăm prudență ridicată."
             )
-        else:
-            distance_text = "în proximitatea zonei analizate"
 
-        if incident_type == "homicide":
-            return f"Atenție: există un incident grav de tip omor raportat {distance_text}, în zona {city}. Recomandăm prudență ridicată."
-        if incident_type == "sexual_violence":
-            return f"Atenție: există un incident grav de violență sexuală raportat {distance_text}, în zona {city}. Recomandăm prudență ridicată."
         if incident_type == "robbery":
-            return f"Există un incident de tâlhărie raportat {distance_text}, în zona {city}. Recomandăm prudență."
+            return (
+                f"Există un incident de tip tâlhărie raportat {distance_text}, "
+                f"în zona {location_label}. Recomandăm prudență."
+            )
 
     if score >= 8:
-        return "Atenționare serioasă: zona prezintă risc ridicat pe baza incidentelor recente și a severității acestora."
+        return "Atenționare serioasă: zona prezintă risc ridicat pe baza incidentelor recente."
     if score >= 5:
         return "Prudență ridicată: au fost identificate evenimente relevante în zona analizată."
     if score >= 2.5:
-        return "Prudență: zona are câteva evenimente raportate, dar nivelul general rămâne moderat."
+        return "Prudență: există evenimente raportate, dar nivelul general rămâne moderat."
+
     return "Situație stabilă: nu au fost identificate incidente grave recente în proximitatea analizată."
 
 
@@ -170,9 +265,15 @@ def fetch_serious_incidents(
         column_or_null(columns, "days_ago"),
         column_or_null(columns, "city"),
         column_or_null(columns, "county"),
+        column_or_null(columns, "locality"),
+        column_or_null(columns, "town"),
+        column_or_null(columns, "judet"),
         column_or_null(columns, "latitude"),
         column_or_null(columns, "longitude"),
         column_or_null(columns, "source_name"),
+        column_or_null(columns, "source"),
+        column_or_null(columns, "source_title"),
+        column_or_null(columns, "publisher"),
         column_or_null(columns, "source_url"),
         column_or_null(columns, "article_url"),
         column_or_null(columns, "url"),
@@ -193,13 +294,14 @@ def fetch_serious_incidents(
                 WHEN 'robbery' THEN 3
                 ELSE 9
             END,
-            COALESCE(days_ago, 99999) ASC
-        LIMIT 200
+            COALESCE(days_ago, 99999) ASC,
+            COALESCE(source_priority, 0) DESC
+        LIMIT ?
     """
 
     conn = get_connection()
     try:
-        rows = conn.execute(query, (lookback_days,)).fetchall()
+        rows = conn.execute(query, (lookback_days, MAX_SERIOUS_SCAN_LIMIT)).fetchall()
     finally:
         conn.close()
 
@@ -208,47 +310,61 @@ def fetch_serious_incidents(
     for raw in rows:
         row = row_to_dict(raw)
 
-        incident_lat = safe_float(row.get("latitude"))
-        incident_lng = safe_float(row.get("longitude"))
+        incident_lat = safe_optional_float(row.get("latitude"))
+        incident_lng = safe_optional_float(row.get("longitude"))
         distance_m = haversine_meters(lat, lng, incident_lat, incident_lng)
 
         if distance_m is not None and distance_m > radius_m:
             continue
 
-        source_url = (
-            row.get("source_url")
-            or row.get("article_url")
-            or row.get("url")
-        )
+        incident_type = row.get("incident_type")
+        source_url = build_source_url(row)
+        source_name = build_source_label(row)
+        location_label = build_location_label(row)
+        distance_text = build_distance_text(distance_m)
+        verification_status = str(row.get("verification_status") or "").lower()
+        is_official = safe_bool(row.get("is_verified")) or verification_status == "verified"
+
+        title = first_value(row, ("title",)) or f"{incident_type_label(incident_type)} raportat"
+        days_ago = safe_int(row.get("days_ago"), 99999)
 
         incidents.append(
             {
                 "id": row.get("id"),
                 "incident_uid": row.get("incident_uid"),
-                "incident_type": row.get("incident_type"),
+                "incident_type": incident_type,
+                "display_type": incident_type_label(incident_type),
                 "severity_level": row.get("severity_level"),
-                "title": row.get("title") or "Incident grav raportat",
+                "title": title,
+                "display_title": title,
                 "summary": row.get("summary"),
                 "event_date": row.get("event_date"),
                 "published_date": row.get("published_date"),
-                "days_ago": safe_int(row.get("days_ago"), 99999),
-                "city": row.get("city"),
-                "county": row.get("county"),
+                "days_ago": days_ago,
+                "city": row.get("city") or row.get("locality") or row.get("town"),
+                "county": row.get("county") or row.get("judet"),
+                "location_label": location_label,
                 "latitude": incident_lat,
                 "longitude": incident_lng,
                 "distance_m": distance_m,
-                "source_name": build_source_label(row),
+                "distance_text": distance_text,
+                "source_name": source_name,
+                "source_label": source_name,
                 "source_url": source_url,
-                "is_official": bool(row.get("is_verified")) or str(row.get("verification_status")).lower() == "verified",
+                "has_source_url": bool(source_url),
+                "is_official": is_official,
+                "official_badge": "OFICIAL" if is_official else "SURSĂ",
                 "verification_status": row.get("verification_status"),
                 "source_priority": safe_int(row.get("source_priority"), 0),
+                "screen_line": f"{incident_type_label(incident_type)} · {distance_text} · {location_label}",
             }
         )
 
     incidents.sort(
-        key=lambda x: (
-            x["distance_m"] if x["distance_m"] is not None else 999999999,
-            x["days_ago"],
+        key=lambda item: (
+            item["distance_m"] if item["distance_m"] is not None else 999999999,
+            item["days_ago"],
+            -item["source_priority"],
         )
     )
 
@@ -259,8 +375,13 @@ def apply_serious_minimum_score(
     base_score: float,
     serious_incidents: list[dict[str, Any]],
 ) -> float:
+    base_score = clamp(base_score, 0.0, 10.0)
+
     if not serious_incidents:
-        return base_score
+        return round(base_score, 2)
+
+    nearest = serious_incidents[0]
+    nearest_distance = nearest.get("distance_m")
 
     has_homicide = any(i.get("incident_type") == "homicide" for i in serious_incidents)
     has_sexual = any(i.get("incident_type") == "sexual_violence" for i in serious_incidents)
@@ -269,15 +390,29 @@ def apply_serious_minimum_score(
     score = base_score
 
     if has_homicide:
-        score = max(score, 6.5)
+        score = max(score, 7.0)
 
     if has_sexual:
-        score = max(score, 6.0)
+        score = max(score, 6.5)
 
     if has_robbery:
-        score = max(score, 4.5)
+        score = max(score, 5.0)
 
-    return min(round(score, 2), 10.0)
+    if nearest_distance is not None:
+        if nearest_distance <= 500:
+            score += 1.0
+        elif nearest_distance <= 1500:
+            score += 0.6
+        elif nearest_distance <= 3000:
+            score += 0.3
+
+    return round(clamp(score, 0.0, 10.0), 2)
+
+
+def normalize_base_response(base: Any) -> dict[str, Any]:
+    if isinstance(base, dict):
+        return base
+    return {}
 
 
 @app.get("/")
@@ -286,7 +421,15 @@ def root() -> dict[str, Any]:
         "app": "Lazarus Safe API",
         "version": APP_VERSION,
         "status": "online",
-        "endpoints": ["/risk", "/heatmap", "/serious-incidents", "/health"],
+        "endpoints": [
+            "/risk",
+            "/heatmap",
+            "/serious-incidents",
+            "/health",
+            "/debug/incidents",
+            "/debug/serious-all",
+            "/map",
+        ],
     }
 
 
@@ -299,23 +442,20 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.on_event("startup")
-def startup() -> None:
-    initialize_database()
-
-
 @app.get("/risk")
 def risk(
-    lat: float = Query(...),
-    lng: float = Query(...),
-    radius_m: int = Query(DEFAULT_RADIUS_M),
-    lookback_days: int = Query(DEFAULT_LOOKBACK_DAYS),
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    radius_m: int = Query(DEFAULT_RADIUS_M, ge=500, le=50000),
+    lookback_days: int = Query(DEFAULT_LOOKBACK_DAYS, ge=1, le=365),
 ) -> dict[str, Any]:
-    base = evaluate_risk(
-        lat=lat,
-        lng=lng,
-        radius_m=radius_m,
-        lookback_days=lookback_days,
+    base = normalize_base_response(
+        evaluate_risk(
+            lat=lat,
+            lng=lng,
+            radius_m=radius_m,
+            lookback_days=lookback_days,
+        )
     )
 
     serious = fetch_serious_incidents(
@@ -326,15 +466,20 @@ def risk(
         limit=10,
     )
 
-    raw_score = float(base.get("score", base.get("risk_score", 0)) or 0)
+    raw_score = safe_float(base.get("score", base.get("risk_score", 0)), 0.0)
     final_score = apply_serious_minimum_score(raw_score, serious)
+    risk_level = classify_risk_level(final_score)
     nearest_serious = serious[0] if serious else None
+    message = human_message(final_score, nearest_serious)
 
     return {
         "score": final_score,
         "risk_score": final_score,
-        "risk_level": classify_risk_level(final_score),
-        "message": human_message(final_score, len(serious), nearest_serious),
+        "risk_level": risk_level,
+        "risk_label": RISK_LEVEL_LABELS.get(risk_level, "Situație analizată"),
+        "risk_badge": risk_badge(final_score),
+        "message": message,
+        "screen_message": message,
         "county": base.get("county"),
         "city": base.get("city"),
         "incidents_summary": base.get("incidents_summary", {}),
@@ -342,6 +487,14 @@ def risk(
         "serious_incidents": serious,
         "nearest_serious_incident": nearest_serious,
         "sources_used": base.get("sources_used", []),
+        "confidence": None,
+        "display": {
+            "title": RISK_LEVEL_LABELS.get(risk_level, "Situație analizată"),
+            "subtitle": f"Scor risc: {final_score:.1f}/10",
+            "main_message": message,
+            "serious_count": len(serious),
+            "nearest_serious": nearest_serious.get("screen_line") if nearest_serious else None,
+        },
         "analyzed_at": now_iso(),
         "meta": {
             "radius_m": radius_m,
@@ -353,11 +506,11 @@ def risk(
 
 @app.get("/serious-incidents")
 def serious_incidents(
-    lat: float = Query(...),
-    lng: float = Query(...),
-    radius_m: int = Query(DEFAULT_RADIUS_M),
-    lookback_days: int = Query(DEFAULT_LOOKBACK_DAYS),
-    limit: int = Query(20),
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    radius_m: int = Query(DEFAULT_RADIUS_M, ge=500, le=50000),
+    lookback_days: int = Query(DEFAULT_LOOKBACK_DAYS, ge=1, le=365),
+    limit: int = Query(20, ge=1, le=50),
 ) -> dict[str, Any]:
     incidents = fetch_serious_incidents(
         lat=lat,
@@ -373,21 +526,24 @@ def serious_incidents(
         "count": len(incidents),
         "nearest_serious_incident": nearest,
         "incidents": incidents,
+        "screen_title": "Incidente grave în apropiere",
+        "screen_empty_message": "Nu au fost identificate incidente grave recente în zona analizată.",
         "analyzed_at": now_iso(),
         "meta": {
             "radius_m": radius_m,
             "lookback_days": lookback_days,
-            "types": list(SERIOUS_TYPES),
+            "types": sorted(SERIOUS_TYPES),
+            "app_version": APP_VERSION,
         },
     }
 
 
 @app.get("/heatmap")
 def heatmap(
-    lat: float = Query(...),
-    lng: float = Query(...),
-    radius_m: int = Query(3000),
-    lookback_days: int = Query(DEFAULT_LOOKBACK_DAYS),
+    lat: float = Query(..., ge=-90, le=90),
+    lng: float = Query(..., ge=-180, le=180),
+    radius_m: int = Query(3000, ge=500, le=50000),
+    lookback_days: int = Query(DEFAULT_LOOKBACK_DAYS, ge=1, le=365),
 ) -> dict[str, Any]:
     points = get_heatmap_points(
         lat=lat,
@@ -403,12 +559,13 @@ def heatmap(
         "meta": {
             "radius_m": radius_m,
             "lookback_days": lookback_days,
+            "app_version": APP_VERSION,
         },
     }
 
 
 @app.get("/debug/incidents")
-def debug_incidents(limit: int = Query(20)) -> dict[str, Any]:
+def debug_incidents(limit: int = Query(20, ge=1, le=100)) -> dict[str, Any]:
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -425,12 +582,12 @@ def debug_incidents(limit: int = Query(20)) -> dict[str, Any]:
 
     return {
         "count": len(rows),
-        "incidents": [row_to_dict(r) for r in rows],
+        "incidents": [row_to_dict(row) for row in rows],
     }
 
 
 @app.get("/debug/serious-all")
-def debug_serious_all(limit: int = Query(50)) -> dict[str, Any]:
+def debug_serious_all(limit: int = Query(50, ge=1, le=100)) -> dict[str, Any]:
     conn = get_connection()
     try:
         rows = conn.execute(
@@ -448,26 +605,28 @@ def debug_serious_all(limit: int = Query(50)) -> dict[str, Any]:
 
     return {
         "count": len(rows),
-        "incidents": [row_to_dict(r) for r in rows],
+        "incidents": [row_to_dict(row) for row in rows],
     }
 
 
 @app.get("/map", response_class=HTMLResponse)
 def map_preview() -> str:
     return """
-    <html>
-      <head>
-        <title>Lazarus Safe API</title>
-      </head>
-      <body style="font-family: Arial; padding: 32px;">
-        <h2>Lazarus Safe API este activ.</h2>
-        <p>Endpoint-uri disponibile:</p>
-        <ul>
-          <li>/risk?lat=44.8565&lng=24.8692</li>
-          <li>/heatmap?lat=44.8565&lng=24.8692</li>
-          <li>/serious-incidents?lat=44.8565&lng=24.8692</li>
-          <li>/debug/serious-all</li>
-        </ul>
-      </body>
-    </html>
-    """GIT
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+    <meta charset="utf-8">
+    <title>Lazarus Safe API</title>
+</head>
+<body style="font-family: Arial, sans-serif; padding: 32px;">
+    <h2>Lazarus Safe API este activ.</h2>
+    <p>Endpoint-uri disponibile:</p>
+    <ul>
+        <li>/risk?lat=44.8565&amp;lng=24.8692</li>
+        <li>/heatmap?lat=44.8565&amp;lng=24.8692</li>
+        <li>/serious-incidents?lat=44.8565&amp;lng=24.8692</li>
+        <li>/debug/serious-all</li>
+    </ul>
+</body>
+</html>
+"""
