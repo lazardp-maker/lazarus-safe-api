@@ -692,7 +692,8 @@ def get_incident_source_candidates(incident_id: int) -> list[dict[str, Any]]:
     for row in rows:
         item = dict(row)
         item["is_official"] = bool(
-            item.get("source_type") == "official" or is_official_source_name(item.get("source_name"))
+            item.get("source_type") == "official"
+            or is_official_source_name(item.get("source_name"))
         )
         result.append(item)
 
@@ -900,8 +901,8 @@ def build_ui_message(level: str, base_reason: str, confidence: float) -> str:
     if level == "Situație stabilă":
         if confidence < 0.35:
             return (
-                f"{base_reason} Zona pare stabilă în acest moment, dar nivelul de încredere "
-                "al evaluării este încă limitat."
+                f"{base_reason} Zona pare stabilă în acest moment, dar nivelul datelor "
+                "disponibile este încă limitat."
             )
         return f"{base_reason} Zona este considerată stabilă în acest moment."
 
@@ -953,6 +954,152 @@ def get_heatmap_points(
         )
 
     return points
+
+
+def data_quality_label(confidence: float) -> str:
+    if confidence >= 0.75:
+        return "Date verificate: ridicat"
+    if confidence >= 0.45:
+        return "Date verificate: mediu"
+    return "Date limitate în această zonă"
+
+
+def risk_simple_title(level: str) -> str:
+    if level == "Atenționare serioasă":
+        return "Atenție: există semnale grave în zonă"
+    if level == "Prudență ridicată":
+        return "Prudență ridicată recomandată"
+    if level == "Prudență":
+        return "Zonă cu risc moderat"
+    if level == "Situație stabilă":
+        return "Zona pare stabilă"
+    return "Date insuficiente"
+
+
+def user_friendly_explanation(
+    level: str,
+    score: float,
+    confidence: float,
+    incidents_count: int,
+    severe_count: int,
+    closest_severe: Optional[dict[str, Any]],
+    lookback_days: int,
+) -> dict[str, Any]:
+    reasons: list[str] = []
+
+    if closest_severe:
+        label = (
+            closest_severe.get("incident_label")
+            or incident_label(closest_severe.get("incident_type"))
+        )
+        distance_text = closest_severe.get("distance_text") or "în apropiere"
+        reasons.append(
+            f"Cel mai apropiat incident grav: {label}, la aproximativ {distance_text}."
+        )
+
+    if severe_count > 0:
+        reasons.append(
+            f"Au fost identificate {severe_count} incidente grave în ultimele {lookback_days} zile."
+        )
+
+    if incidents_count > 0:
+        reasons.append(
+            f"Au fost analizate {incidents_count} incidente relevante în zona/localitatea selectată."
+        )
+
+    if not reasons:
+        reasons.append("Nu au fost identificate incidente grave recente în proximitatea analizată.")
+
+    return {
+        "title": risk_simple_title(level),
+        "score_text": f"{score}/10",
+        "data_quality_label": data_quality_label(confidence),
+        "reasons": reasons,
+        "legend": [
+            "📍 Locația analizată",
+            "🔥 Zonă cu risc aproximativ",
+            "⚠️ Incident raportat",
+        ],
+        "important_note": (
+            "Heatmap-ul indică o zonă de risc aproximativă, nu locul exact al incidentului. "
+            "Locurile exacte sunt afișate separat prin markere de incident, atunci când există coordonate."
+        ),
+    }
+
+
+def get_serious_incidents_for_location(
+    center_lat: float,
+    center_lng: float,
+    radius_m: int = 15000,
+    lookback_days: int = 365,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    incidents = get_incidents_near_point(
+        center_lat=center_lat,
+        center_lng=center_lng,
+        radius_m=radius_m,
+        lookback_days=lookback_days,
+    )
+
+    serious = [
+        item for item in incidents
+        if item.get("incident_type") in SEVERE_INCIDENT_TYPES
+    ]
+
+    serious.sort(key=lambda x: float(x.get("distance_m") or 999999))
+
+    result: list[dict[str, Any]] = []
+
+    for item in serious[:limit]:
+        source = select_primary_source_for_incident(item)
+
+        source_name = None
+        source_type = None
+        source_url = None
+        source_title = None
+        official_confirmation = False
+
+        if source:
+            source_name = source.get("source_name")
+            source_type = source.get("source_type")
+            source_url = source.get("source_url")
+            source_title = source.get("source_title")
+            official_confirmation = bool(source.get("is_official"))
+
+        verification_label = (
+            "Confirmat oficial"
+            if official_confirmation
+            else "Publicat în presă"
+            if source_url
+            else "Sursă neclară"
+        )
+
+        result.append(
+            {
+                "incident_id": item.get("id"),
+                "incident_type": item.get("incident_type"),
+                "incident_label": incident_label(item.get("incident_type")),
+                "severity": item.get("severity_level"),
+                "title": item.get("title"),
+                "summary": item.get("summary"),
+                "city": item.get("city"),
+                "county": item.get("county"),
+                "latitude": item.get("latitude"),
+                "longitude": item.get("longitude"),
+                "distance_m": item.get("distance_m"),
+                "distance_text": format_distance(item.get("distance_m")),
+                "days_ago": item.get("days_ago"),
+                "published_date": item.get("published_date"),
+                "source_name": source_name,
+                "source_type": source_type,
+                "source_url": source_url,
+                "source_title": source_title,
+                "official_confirmation": official_confirmation,
+                "verification_label": verification_label,
+            }
+        )
+
+    return result
 
 
 def evaluate_risk(
@@ -1105,10 +1252,12 @@ def evaluate_risk(
     score_floor = score_floor_from_severity(counts, closest_severe)
     score_0_10 = round(max(preliminary_score_0_10, score_floor), 1)
 
-    verified_count = sum(1 for item in incidents_area_enriched if safe_int(item.get("is_verified"), 0) == 1)
+    verified_count = sum(
+        1 for item in incidents_area_enriched
+        if safe_int(item.get("is_verified"), 0) == 1
+    )
     geo_count = sum(
-        1
-        for item in incidents_area_enriched
+        1 for item in incidents_area_enriched
         if item.get("latitude") is not None and item.get("longitude") is not None
     )
 

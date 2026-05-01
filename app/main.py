@@ -21,11 +21,13 @@ from app.risk_engine import (
     evaluate_risk,
     get_heatmap_points,
     get_sources_used,
+    get_serious_incidents_for_location,
+    user_friendly_explanation,
 )
 from app.schemas import AnalyzeRequest, AnalyzeResponse, ClosestSevereIncident
 
 APP_NAME = "Lazarus Safe API"
-APP_VERSION = os.getenv("APP_VERSION", "3.4.0")
+APP_VERSION = os.getenv("APP_VERSION", "3.5.1")
 APP_ENV = os.getenv("APP_ENV", "development")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 GEOCODER_TIMEOUT_SECONDS = int(os.getenv("GEOCODER_TIMEOUT_SECONDS", "10"))
@@ -41,7 +43,7 @@ app = FastAPI(
     version=APP_VERSION,
     description=(
         "API pentru evaluarea riscului de securitate fizică pe baza locației, "
-        "cu suport pentru analiză geospațială și colectare de date publice."
+        "cu suport pentru analiză geospațială, surse citate și explicații pe înțelesul utilizatorului."
     ),
 )
 
@@ -170,23 +172,13 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
     }
 
     try:
-        response = requests.get(
-            url,
-            params=params,
-            headers=headers,
-            timeout=GEOCODER_TIMEOUT_SECONDS,
-        )
+        response = requests.get(url, params=params, headers=headers, timeout=GEOCODER_TIMEOUT_SECONDS)
         response.raise_for_status()
 
         data = response.json()
         address = data.get("address", {})
 
-        raw_county = (
-            address.get("county")
-            or address.get("state_district")
-            or address.get("state")
-        )
-
+        raw_county = address.get("county") or address.get("state_district") or address.get("state")
         raw_city = (
             address.get("city")
             or address.get("municipality")
@@ -206,26 +198,11 @@ def reverse_geocode_real(lat: float, lng: float) -> tuple[Optional[str], Optiona
         if county == "bucuresti" and not city:
             city = "bucuresti"
 
-        logger.info(
-            "reverse_geocode.success lat=%s lng=%s raw_county=%s raw_city=%s county=%s city=%s",
-            lat,
-            lng,
-            raw_county,
-            raw_city,
-            county,
-            city,
-        )
-
         if county:
             return county, city
 
     except Exception as exc:
-        logger.warning(
-            "reverse_geocode.failed lat=%s lng=%s error=%s",
-            lat,
-            lng,
-            exc,
-        )
+        logger.warning("reverse_geocode.failed lat=%s lng=%s error=%s", lat, lng, exc)
 
     if 44.3 <= lat <= 44.6 and 25.9 <= lng <= 26.3:
         return "bucuresti", "bucuresti"
@@ -250,20 +227,22 @@ def empty_incidents_summary() -> dict[str, int]:
     }
 
 
-def incidents_summary_to_dict(value: Any) -> dict[str, int]:
+def model_to_dict(value: Any) -> dict[str, Any]:
     if value is None:
-        return empty_incidents_summary()
-
+        return {}
     if isinstance(value, dict):
-        summary = value.copy()
-    elif hasattr(value, "dict"):
-        summary = value.dict()
-    elif hasattr(value, "model_dump"):
-        summary = value.model_dump()
-    else:
-        return empty_incidents_summary()
+        return value
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    return {}
 
+
+def incidents_summary_to_dict(value: Any) -> dict[str, int]:
+    summary = model_to_dict(value)
     default_summary = empty_incidents_summary()
+
     for key, val in summary.items():
         try:
             default_summary[key] = int(val)
@@ -273,9 +252,34 @@ def incidents_summary_to_dict(value: Any) -> dict[str, int]:
     return default_summary
 
 
+def build_closest_payload(closest_raw: Any) -> Optional[ClosestSevereIncident]:
+    if not isinstance(closest_raw, dict):
+        return None
+
+    return ClosestSevereIncident(
+        incident_id=closest_raw.get("incident_id"),
+        incident_type=closest_raw.get("incident_type"),
+        incident_label=closest_raw.get("incident_label"),
+        distance_m=closest_raw.get("distance_m"),
+        distance_text=closest_raw.get("distance_text"),
+        days_ago=closest_raw.get("days_ago"),
+        city=closest_raw.get("city"),
+        county=closest_raw.get("county"),
+        title=closest_raw.get("title"),
+        summary=closest_raw.get("summary"),
+        latitude=closest_raw.get("latitude"),
+        longitude=closest_raw.get("longitude"),
+        published_date=closest_raw.get("published_date"),
+        official_confirmation=bool(closest_raw.get("official_confirmation", False)),
+        primary_source_name=closest_raw.get("primary_source_name"),
+        primary_source_type=closest_raw.get("primary_source_type"),
+        primary_source_url=closest_raw.get("primary_source_url"),
+        primary_source_title=closest_raw.get("primary_source_title"),
+    )
+
+
 def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
     analyzed_at = datetime.now(timezone.utc).isoformat()
-
     county, city = reverse_geocode_real(payload.lat, payload.lng)
 
     if not county:
@@ -292,28 +296,14 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
             confidence_percent=0.0,
             closest_severe_incident=None,
             analyzed_at=analyzed_at,
-            debug={
-                "reason": "reverse_geocode_failed",
-                "input_lat": payload.lat,
-                "input_lng": payload.lng,
-            },
+            debug={"reason": "reverse_geocode_failed", "input_lat": payload.lat, "input_lng": payload.lng},
         )
 
     try:
-        result = evaluate_risk(
-            county=county,
-            city=city,
-            user_lat=payload.lat,
-            user_lng=payload.lng,
-        )
+        result = evaluate_risk(county=county, city=city, user_lat=payload.lat, user_lng=payload.lng)
         sources_used = get_sources_used(county, city)
     except Exception as exc:
-        logger.exception(
-            "risk_engine.failed county=%s city=%s error=%s",
-            county,
-            city,
-            exc,
-        )
+        logger.exception("risk_engine.failed county=%s city=%s error=%s", county, city, exc)
         return AnalyzeResponse(
             level="Date insuficiente",
             score=0.0,
@@ -327,21 +317,10 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
             confidence_percent=0.0,
             closest_severe_incident=None,
             analyzed_at=analyzed_at,
-            debug={
-                "reason": "risk_engine_failed",
-                "error": str(exc),
-                "county": county,
-                "city": city,
-            },
+            debug={"reason": "risk_engine_failed", "error": str(exc), "county": county, "city": city},
         )
 
     if not isinstance(result, dict):
-        logger.warning(
-            "risk_engine.invalid_result_type county=%s city=%s type=%s",
-            county,
-            city,
-            type(result).__name__,
-        )
         return AnalyzeResponse(
             level="Date insuficiente",
             score=0.0,
@@ -355,43 +334,12 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
             confidence_percent=0.0,
             closest_severe_incident=None,
             analyzed_at=analyzed_at,
-            debug={
-                "reason": "invalid_risk_result",
-                "county": county,
-                "city": city,
-            },
+            debug={"reason": "invalid_risk_result", "county": county, "city": city},
         )
 
-    incidents_summary = incidents_summary_to_dict(
-        result.get("incidents_summary", empty_incidents_summary())
-    )
+    incidents_summary = incidents_summary_to_dict(result.get("incidents_summary", empty_incidents_summary()))
     incidents_count = sum(int(v) for v in incidents_summary.values())
     confidence_raw = float(result.get("confidence", 0.0) or 0.0)
-    confidence_percent = round(confidence_raw * 100.0, 1)
-
-    closest_raw = result.get("closest_severe_incident")
-    closest_payload = None
-    if isinstance(closest_raw, dict):
-        closest_payload = ClosestSevereIncident(
-            incident_id=closest_raw.get("incident_id"),
-            incident_type=closest_raw.get("incident_type"),
-            incident_label=closest_raw.get("incident_label"),
-            distance_m=closest_raw.get("distance_m"),
-            distance_text=closest_raw.get("distance_text"),
-            days_ago=closest_raw.get("days_ago"),
-            city=closest_raw.get("city"),
-            county=closest_raw.get("county"),
-            title=closest_raw.get("title"),
-            summary=closest_raw.get("summary"),
-            latitude=closest_raw.get("latitude"),
-            longitude=closest_raw.get("longitude"),
-            published_date=closest_raw.get("published_date"),
-            official_confirmation=bool(closest_raw.get("official_confirmation", False)),
-            primary_source_name=closest_raw.get("primary_source_name"),
-            primary_source_type=closest_raw.get("primary_source_type"),
-            primary_source_url=closest_raw.get("primary_source_url"),
-            primary_source_title=closest_raw.get("primary_source_title"),
-        )
 
     return AnalyzeResponse(
         level=result.get("level", "Date insuficiente"),
@@ -403,30 +351,54 @@ def build_analysis_response(payload: AnalyzeRequest) -> AnalyzeResponse:
         incidents_count=incidents_count,
         sources_used=sources_used if isinstance(sources_used, list) else [],
         confidence=confidence_raw,
-        confidence_percent=confidence_percent,
-        closest_severe_incident=closest_payload,
+        confidence_percent=round(confidence_raw * 100.0, 1),
+        closest_severe_incident=build_closest_payload(result.get("closest_severe_incident")),
         analyzed_at=analyzed_at,
         debug=result.get("meta") if isinstance(result.get("meta"), dict) else {},
     )
+
+
+def build_human_risk_payload(result: AnalyzeResponse) -> dict[str, Any]:
+    debug = result.debug if isinstance(result.debug, dict) else {}
+    severe_count = int(debug.get("severe_count", 0) or 0)
+    lookback_days = int(debug.get("lookback_days", 60) or 60)
+
+    closest_dict = model_to_dict(result.closest_severe_incident) if result.closest_severe_incident else None
+
+    friendly = user_friendly_explanation(
+        level=result.level,
+        score=result.score,
+        confidence=result.confidence,
+        incidents_count=result.incidents_count,
+        severe_count=severe_count,
+        closest_severe=closest_dict,
+        lookback_days=lookback_days,
+    )
+
+    return {
+        "human_title": friendly.get("title"),
+        "score_text": friendly.get("score_text"),
+        "data_quality_label": friendly.get("data_quality_label"),
+        "risk_reasons": friendly.get("reasons", []),
+        "map_legend": friendly.get("legend", []),
+        "heatmap_note": friendly.get("important_note"),
+        "serious_incidents_count": severe_count,
+        "lookback_days": lookback_days,
+    }
 
 
 @app.get("/health")
 def health() -> dict[str, Any]:
     with get_connection() as conn:
         cursor = conn.cursor()
-
         cursor.execute("SELECT COUNT(*) AS total FROM sources")
         sources_total = cursor.fetchone()["total"]
-
         cursor.execute("SELECT COUNT(*) AS total FROM area_risk_profiles")
         profiles_total = cursor.fetchone()["total"]
-
         cursor.execute("SELECT COUNT(*) AS total FROM incidents")
         incidents_total = cursor.fetchone()["total"]
-
         cursor.execute("SELECT COUNT(*) AS total FROM articles")
         articles_total = cursor.fetchone()["total"]
-
         cursor.execute("SELECT COUNT(*) AS total FROM incidents WHERE latitude IS NOT NULL AND longitude IS NOT NULL")
         geo_incidents_total = cursor.fetchone()["total"]
 
@@ -452,13 +424,7 @@ def ready() -> dict[str, Any]:
         with get_connection() as conn:
             tables = list_tables(conn)
 
-        required_tables = {
-            "sources",
-            "area_risk_profiles",
-            "incidents",
-            "articles",
-            "incident_mentions",
-        }
+        required_tables = {"sources", "area_risk_profiles", "incidents", "articles", "incident_mentions"}
         missing_tables = sorted(required_tables - set(tables))
 
         return {
@@ -469,10 +435,7 @@ def ready() -> dict[str, Any]:
         }
     except Exception as exc:
         logger.exception("ready.failed error=%s", exc)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Readiness check failed: {exc}",
-        )
+        raise HTTPException(status_code=500, detail=f"Readiness check failed: {exc}")
 
 
 @app.get("/debug/db")
@@ -489,11 +452,7 @@ def debug_db() -> dict[str, Any]:
             except Exception:
                 columns[table_name] = []
 
-        return {
-            "db_path": get_db_path(),
-            "tables": tables,
-            "columns": columns,
-        }
+    return {"db_path": get_db_path(), "tables": tables, "columns": columns}
 
 
 @app.get("/admin/db-summary")
@@ -503,19 +462,14 @@ def admin_db_summary() -> dict[str, Any]:
 
         cursor.execute("SELECT COUNT(*) AS total FROM sources")
         sources_total = cursor.fetchone()["total"]
-
         cursor.execute("SELECT COUNT(*) AS total FROM articles")
         articles_total = cursor.fetchone()["total"]
-
         cursor.execute("SELECT COUNT(*) AS total FROM incidents")
         incidents_total = cursor.fetchone()["total"]
-
         cursor.execute("SELECT COUNT(*) AS total FROM incident_mentions")
         mentions_total = cursor.fetchone()["total"]
-
         cursor.execute("SELECT COUNT(*) AS total FROM area_risk_profiles")
         profiles_total = cursor.fetchone()["total"]
-
         cursor.execute("SELECT COUNT(*) AS total FROM incidents WHERE latitude IS NOT NULL AND longitude IS NOT NULL")
         geo_incidents_total = cursor.fetchone()["total"]
 
@@ -527,10 +481,7 @@ def admin_db_summary() -> dict[str, Any]:
             ORDER BY total DESC
             """
         )
-        by_verification = [
-            {"verification_status": row["verification_status"], "total": row["total"]}
-            for row in cursor.fetchall()
-        ]
+        by_verification = [dict(row) for row in cursor.fetchall()]
 
         cursor.execute(
             """
@@ -540,10 +491,7 @@ def admin_db_summary() -> dict[str, Any]:
             ORDER BY total DESC
             """
         )
-        by_type = [
-            {"incident_type": row["incident_type"], "total": row["total"]}
-            for row in cursor.fetchall()
-        ]
+        by_type = [dict(row) for row in cursor.fetchall()]
 
         cursor.execute(
             """
@@ -555,10 +503,7 @@ def admin_db_summary() -> dict[str, Any]:
             LIMIT 20
             """
         )
-        by_county = [
-            {"county": row["county"], "total": row["total"]}
-            for row in cursor.fetchall()
-        ]
+        by_county = [dict(row) for row in cursor.fetchall()]
 
     return {
         "db_path": get_db_path(),
@@ -592,44 +537,17 @@ def admin_recent_incidents(
     if county_n:
         where_parts.append("county = ?")
         params.append(county_n)
-
     if city_n:
         where_parts.append("city = ?")
         params.append(city_n)
-
     if only_geocoded:
         where_parts.append("latitude IS NOT NULL AND longitude IS NOT NULL")
 
-    where_sql = " AND ".join(where_parts)
-
     query = f"""
-        SELECT
-            id,
-            incident_uid,
-            incident_type,
-            severity_level,
-            title,
-            summary,
-            event_date,
-            published_date,
-            days_ago,
-            address_text,
-            location_text,
-            city,
-            county,
-            latitude,
-            longitude,
-            geo_confidence,
-            ai_confidence,
-            is_verified,
-            verification_status,
-            source_priority,
-            created_at
+        SELECT *
         FROM incidents
-        WHERE {where_sql}
-        ORDER BY
-            COALESCE(date(event_date), date(published_date), date(created_at)) DESC,
-            id DESC
+        WHERE {" AND ".join(where_parts)}
+        ORDER BY COALESCE(date(event_date), date(published_date), date(created_at)) DESC, id DESC
         LIMIT ?
     """
     params.append(limit)
@@ -639,43 +557,10 @@ def admin_recent_incidents(
         cursor.execute(query, params)
         rows = cursor.fetchall()
 
-    incidents = []
-    for row in rows:
-        incidents.append(
-            {
-                "id": row["id"],
-                "incident_uid": row["incident_uid"],
-                "incident_type": row["incident_type"],
-                "severity_level": row["severity_level"],
-                "title": row["title"],
-                "summary": row["summary"],
-                "event_date": row["event_date"],
-                "published_date": row["published_date"],
-                "days_ago": row["days_ago"],
-                "address_text": row["address_text"],
-                "location_text": row["location_text"],
-                "city": row["city"],
-                "county": row["county"],
-                "latitude": row["latitude"],
-                "longitude": row["longitude"],
-                "geo_confidence": row["geo_confidence"],
-                "ai_confidence": row["ai_confidence"],
-                "is_verified": row["is_verified"],
-                "verification_status": row["verification_status"],
-                "source_priority": row["source_priority"],
-                "created_at": row["created_at"],
-            }
-        )
-
     return {
-        "count": len(incidents),
-        "filters": {
-            "county": county_n,
-            "city": city_n,
-            "limit": limit,
-            "only_geocoded": only_geocoded,
-        },
-        "items": incidents,
+        "count": len(rows),
+        "filters": {"county": county_n, "city": city_n, "limit": limit, "only_geocoded": only_geocoded},
+        "items": [dict(row) for row in rows],
     }
 
 
@@ -687,16 +572,10 @@ def admin_run_collector() -> dict[str, str]:
 
         run_collector()
         logger.info("collector.manual_run.complete")
-        return {
-            "status": "ok",
-            "message": "Collectorul a rulat cu succes.",
-        }
+        return {"status": "ok", "message": "Collectorul a rulat cu succes."}
     except Exception as exc:
         logger.exception("collector.manual_run.failed error=%s", exc)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Eroare la rularea collectorului: {exc}",
-        )
+        raise HTTPException(status_code=500, detail=f"Eroare la rularea collectorului: {exc}")
 
 
 @app.post("/analyze", response_model=AnalyzeResponse)
@@ -720,25 +599,74 @@ def get_risk(
 
     payload = AnalyzeRequest(lat=lat, lng=lng)
     result = build_analysis_response(payload)
+    human = build_human_risk_payload(result)
 
     return {
         "risk_level": result.level,
+        "level_label": result.level,
         "score": result.score,
+        "score_text": human["score_text"],
         "message": result.message,
+        "human_title": human["human_title"],
+        "data_quality_label": human["data_quality_label"],
+        "risk_reasons": human["risk_reasons"],
+        "map_legend": human["map_legend"],
+        "heatmap_note": human["heatmap_note"],
         "county": result.county,
         "city": result.city,
         "confidence": result.confidence,
         "confidence_percent": result.confidence_percent,
-        "incidents_summary": result.incidents_summary.model_dump(),
+        "incidents_summary": model_to_dict(result.incidents_summary),
         "incidents_count": result.incidents_count,
+        "serious_incidents_count": human["serious_incidents_count"],
         "sources_used": result.sources_used,
-        "closest_severe_incident": (
-            result.closest_severe_incident.model_dump()
-            if result.closest_severe_incident is not None
-            else None
-        ),
+        "closest_severe_incident": model_to_dict(result.closest_severe_incident)
+        if result.closest_severe_incident is not None
+        else None,
         "analyzed_at": result.analyzed_at,
         "debug": result.debug,
+    }
+
+
+@app.get("/serious-incidents")
+def serious_incidents(
+    lat: float = Query(..., description="Latitudine centru"),
+    lng: float = Query(..., description="Longitudine centru"),
+    radius_m: int = Query(default=15000, ge=500, le=50000, description="Rază în metri"),
+    lookback_days: int = Query(default=365, ge=1, le=365, description="Fereastră analiză"),
+    limit: int = Query(default=20, ge=1, le=50, description="Număr maxim incidente"),
+) -> dict[str, Any]:
+    validate_coordinates(lat, lng)
+
+    try:
+        items = get_serious_incidents_for_location(
+            center_lat=lat,
+            center_lng=lng,
+            radius_m=radius_m,
+            lookback_days=lookback_days,
+            limit=limit,
+        )
+    except Exception as exc:
+        logger.exception("serious_incidents.failed lat=%s lng=%s error=%s", lat, lng, exc)
+        raise HTTPException(status_code=500, detail=f"Eroare la încărcarea incidentelor grave: {exc}")
+
+    return {
+        "count": len(items),
+        "radius_m": radius_m,
+        "lookback_days": lookback_days,
+        "title": "Incidente grave raportate și surse",
+        "explanation": (
+            "Această pagină afișează incidentele grave raportate în zona extinsă: "
+            "omucidere, violență sexuală și tâlhărie. Fiecare incident este afișat "
+            "cu sursa principală disponibilă."
+        ),
+        "legend": [
+            "🚨 Incident grav",
+            "✅ Confirmat oficial",
+            "📰 Publicat în presă",
+            "📍 Locație aproximativă",
+        ],
+        "items": items,
     }
 
 
@@ -759,24 +687,19 @@ def heatmap(
             lookback_days=lookback_days,
         )
     except Exception as exc:
-        logger.exception(
-            "heatmap.failed lat=%s lng=%s radius_m=%s lookback_days=%s error=%s",
-            lat,
-            lng,
-            radius_m,
-            lookback_days,
-            exc,
-        )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Eroare la generarea heatmap: {exc}",
-        )
+        logger.exception("heatmap.failed lat=%s lng=%s error=%s", lat, lng, exc)
+        raise HTTPException(status_code=500, detail=f"Eroare la generarea heatmap: {exc}")
 
     return {
         "count": len(points),
         "geo_points_found": len(points),
         "radius_m": radius_m,
         "lookback_days": lookback_days,
+        "mode": "real_geo_only",
+        "explanation": (
+            "Heatmap-ul indică zone aproximative de risc calculate din incidente geolocalizate. "
+            "Nu reprezintă automat locul exact al unui incident."
+        ),
         "points": points,
     }
 
@@ -798,7 +721,10 @@ def home() -> str:
             <li>POST /analyze</li>
             <li>POST /location-risk</li>
             <li>GET /risk</li>
+            <li>GET /serious-incidents</li>
             <li>GET /heatmap</li>
+            <li>GET /health</li>
+            <li>GET /ready</li>
         </ul>
     </body>
     </html>

@@ -290,7 +290,27 @@ def validate_critical_columns(conn: sqlite3.Connection | None = None) -> None:
     finally:
         if owns_connection and conn is not None:
             conn.close()
+def migrate_database(conn: sqlite3.Connection) -> None:
+    columns_articles = set(list_columns("articles", conn))
+    columns_incidents = set(list_columns("incidents", conn))
 
+    if "location_text" not in columns_articles:
+        conn.execute("ALTER TABLE articles ADD COLUMN location_text TEXT")
+
+    if "primary_source_name" not in columns_incidents:
+        conn.execute("ALTER TABLE incidents ADD COLUMN primary_source_name TEXT")
+
+    if "primary_source_url" not in columns_incidents:
+        conn.execute("ALTER TABLE incidents ADD COLUMN primary_source_url TEXT")
+
+    if "primary_source_type" not in columns_incidents:
+        conn.execute("ALTER TABLE incidents ADD COLUMN primary_source_type TEXT")
+
+    if "primary_source_title" not in columns_incidents:
+        conn.execute("ALTER TABLE incidents ADD COLUMN primary_source_title TEXT")
+
+    if "verification_label" not in columns_incidents:
+        conn.execute("ALTER TABLE incidents ADD COLUMN verification_label TEXT")
 
 def initialize_database() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
