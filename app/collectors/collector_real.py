@@ -148,7 +148,10 @@ def haversine_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> floa
 
 def is_official_source_name(name: Optional[str]) -> bool:
     value = normalize_for_match(name)
-    return any(token in value for token in ("politia", "ipj", "mai", "isu", "igsu", "dsu", "parchet", "diicot", "jandarmeria"))
+    return any(
+        token in value
+        for token in ("politia", "ipj", "mai", "isu", "igsu", "dsu", "parchet", "diicot", "jandarmeria")
+    )
 
 
 def is_public_safety_article(text: str, source: SourceItem) -> bool:
@@ -182,7 +185,12 @@ def should_keep_parsed_result(parsed: dict, source: SourceItem, combined_text: s
     if parsed.get("incident_type") == "general":
         return False, "general_type"
 
-    if float(parsed.get("ai_confidence", 0.0)) < MIN_AI_CONFIDENCE:
+    try:
+        ai_confidence = float(parsed.get("ai_confidence", 0.0))
+    except (TypeError, ValueError):
+        ai_confidence = 0.0
+
+    if ai_confidence < MIN_AI_CONFIDENCE:
         return False, "low_confidence"
 
     if is_noise(combined_text):
@@ -259,7 +267,10 @@ def is_valid_article_url(url: str) -> bool:
         return False
 
     lowered = url.lower()
-    blocked_suffixes = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".zip")
+    blocked_suffixes = (
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf", ".doc",
+        ".docx", ".xls", ".xlsx", ".zip",
+    )
     blocked_fragments = [
         "javascript:", "mailto:", "/tag/", "/eticheta/", "/categorie/", "/category/",
         "/author/", "/autor/", "/page/", "/privacy", "/cookie", "/termeni",
@@ -369,7 +380,13 @@ def geocode_query(session: requests.Session, query: Optional[str]) -> Optional[t
         return _geocode_cache[cache_key]
 
     url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": query, "format": "jsonv2", "limit": 1, "countrycodes": "ro", "addressdetails": 1}
+    params = {
+        "q": query,
+        "format": "jsonv2",
+        "limit": 1,
+        "countrycodes": "ro",
+        "addressdetails": 1,
+    }
 
     try:
         response = session.get(url, params=params, headers=GEOCODE_HEADERS, timeout=GEOCODE_TIMEOUT)
@@ -526,7 +543,9 @@ def get_recent_candidate_incidents_for_match(conn, parsed: dict, source: SourceI
         params.append(city)
 
     if published_date:
-        where_parts.append("ABS(julianday(COALESCE(event_date, published_date, created_at)) - julianday(?)) <= 3")
+        where_parts.append(
+            "ABS(julianday(COALESCE(event_date, published_date, created_at)) - julianday(?)) <= 3"
+        )
         params.append(published_date)
 
     query = f"""
@@ -577,13 +596,16 @@ def compute_incident_match_score(existing: dict, parsed: dict, source: SourceIte
     parsed_lng = safe_float(parsed.get("longitude"))
 
     if None not in (existing_lat, existing_lng, parsed_lat, parsed_lng):
-        dist = haversine_meters(existing_lat, existing_lng, parsed_lat, parsed_lng)
-        if dist <= 120:
-            score += 0.24
-        elif dist <= 350:
-            score += 0.18
-        elif dist <= 800:
-            score += 0.10
+        try:
+            dist = haversine_meters(existing_lat, existing_lng, parsed_lat, parsed_lng)
+            if dist <= 120:
+                score += 0.24
+            elif dist <= 350:
+                score += 0.18
+            elif dist <= 800:
+                score += 0.10
+        except Exception:
+            pass
 
     if int(existing.get("is_verified") or 0) == 1 or source.source_type == "official":
         score += 0.03
@@ -609,7 +631,15 @@ def find_matching_incident(conn, parsed: dict, source: SourceItem) -> Optional[i
     return None
 
 
-def save_incident_mention(conn, incident_id: int, source: SourceItem, article_id: int, mention_title: str, mention_url: str, published_date: Optional[str]) -> None:
+def save_incident_mention(
+    conn,
+    incident_id: int,
+    source: SourceItem,
+    article_id: int,
+    mention_title: str,
+    mention_url: str,
+    published_date: Optional[str],
+) -> None:
     cursor = conn.cursor()
     cursor.execute(
         """
@@ -834,7 +864,9 @@ def process_source(session: requests.Session, source: SourceItem) -> SourceRunSt
                     continue
 
                 stats.geocode_attempts += 1
-                lat, lng, geo_confidence, geocode_used, geo_display_name = geocode_parsed_incident(session, parsed, source)
+                lat, lng, geo_confidence, geocode_used, geo_display_name = geocode_parsed_incident(
+                    session, parsed, source
+                )
 
                 parsed["latitude"] = lat
                 parsed["longitude"] = lng
