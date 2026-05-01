@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from math import asin, cos, radians, sin, sqrt
 from typing import Any, Optional
 
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -13,7 +14,7 @@ from app.db import get_connection, initialize_database
 from app.risk_engine import evaluate_risk, get_heatmap_points
 
 
-APP_VERSION = "3.4.3"
+APP_VERSION = "3.5.0"
 DEFAULT_LOOKBACK_DAYS = 120
 DEFAULT_RADIUS_M = 10000
 MAX_SERIOUS_SCAN_LIMIT = 300
@@ -37,6 +38,18 @@ RISK_LEVEL_LABELS = {
     "low": "Prudență",
     "medium": "Prudență ridicată",
     "high": "Atenționare serioasă",
+}
+
+TYPE_PRIORITY = {
+    "homicide": 100,
+    "sexual_violence": 90,
+    "robbery": 75,
+    "violence": 60,
+    "theft": 40,
+    "traffic": 30,
+    "emergency": 30,
+    "public_order": 20,
+    "general": 10,
 }
 
 
@@ -160,8 +173,24 @@ def first_value(row: dict[str, Any], keys: tuple[str, ...]) -> Optional[str]:
     return None
 
 
+def normalize_county_name(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+
+    text = value.strip()
+    lower = text.lower()
+
+    if lower in {"arges", "argeș"}:
+        return "Județul Argeș"
+
+    if lower.startswith("județul") or lower.startswith("judetul"):
+        return text
+
+    return f"Județul {text.title()}"
+
+
 def build_source_label(row: dict[str, Any]) -> str:
-    return first_value(row, ("source_name", "source", "source_title", "publisher")) or "Sursă necunoscută"
+    return first_value(row, ("source_name", "source", "source_title", "publisher")) or "Sursă media / publică"
 
 
 def build_source_url(row: dict[str, Any]) -> Optional[str]:
@@ -170,7 +199,8 @@ def build_source_url(row: dict[str, Any]) -> Optional[str]:
 
 def build_location_label(row: dict[str, Any]) -> str:
     city = first_value(row, ("city", "locality", "town"))
-    county = first_value(row, ("county", "judet"))
+    county_raw = first_value(row, ("county", "judet"))
+    county = normalize_county_name(county_raw)
 
     if city and county:
         return f"{city}, {county}"
@@ -178,12 +208,12 @@ def build_location_label(row: dict[str, Any]) -> str:
         return city
     if county:
         return county
-    return "Localitate neprecizată"
+    return "Localizare neprecizată"
 
 
 def build_distance_text(distance_m: Optional[float]) -> str:
     if distance_m is None:
-        return "Distanță indisponibilă"
+        return "localizare estimată"
     if distance_m < 1000:
         return f"aprox. {round(distance_m)} m"
     return f"aprox. {round(distance_m / 1000, 1)} km"
@@ -215,11 +245,211 @@ def risk_badge(score: float) -> str:
     return f"{label} · {score:.1f}/10"
 
 
+def incident_importance_score(item: dict[str, Any]) -> float:
+    incident_type = str(item.get("incident_type") or "general")
+    priority = TYPE_PRIORITY.get(incident_type, 10)
+
+    distance_m = item.get("distance_m")
+    days_ago = safe_int(item.get("days_ago"), 99999)
+    source_priority = safe_int(item.get("source_priority"), 0)
+
+    distance_bonus = 0
+    if distance_m is None:
+        distance_bonus = 10
+    elif distance_m <= 500:
+        distance_bonus = 35
+    elif distance_m <= 1500:
+        distance_bonus = 25
+    elif distance_m <= 3000:
+        distance_bonus = 15
+    elif distance_m <= 10000:
+        distance_bonus = 5
+
+    recency_bonus = 0
+    if days_ago <= 3:
+        recency_bonus = 25
+    elif days_ago <= 7:
+        recency_bonus = 20
+    elif days_ago <= 30:
+        recency_bonus = 12
+    elif days_ago <= 120:
+        recency_bonus = 5
+
+    source_bonus = min(source_priority * 2, 10)
+
+    return priority + distance_bonus + recency_bonus + source_bonus
+
+
+def choose_dominant_incident(serious_incidents: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    if not serious_incidents:
+        return None
+
+    return sorted(
+        serious_incidents,
+        key=lambda item: incident_importance_score(item),
+        reverse=True,
+    )[0]
+
+
+def build_data_quality(serious_incidents: list[dict[str, Any]]) -> dict[str, Any]:
+    if not serious_incidents:
+        return {
+            "level": "bună",
+            "label": "Date fără incidente grave recente",
+            "message": "Nu au fost identificate incidente grave în setul curent de date pentru zona analizată.",
+            "has_precise_location": True,
+            "has_source_links": True,
+        }
+
+    with_coords = [i for i in serious_incidents if i.get("latitude") is not None and i.get("longitude") is not None]
+    with_links = [i for i in serious_incidents if i.get("source_url")]
+
+    has_precise_location = len(with_coords) > 0
+    has_source_links = len(with_links) > 0
+
+    if has_precise_location and has_source_links:
+        level = "bună"
+        label = "Date utile pentru analiză"
+        message = "Există incidente cu localizare și surse disponibile."
+    elif has_precise_location and not has_source_links:
+        level = "medie"
+        label = "Localizare disponibilă, surse incomplete"
+        message = "Există localizare pentru unele incidente, dar nu toate au link de verificare."
+    elif not has_precise_location and has_source_links:
+        level = "medie"
+        label = "Surse disponibile, localizare estimată"
+        message = "Unele incidente au surse, dar coordonatele exacte lipsesc."
+    else:
+        level = "limitată"
+        label = "Localizare estimată"
+        message = "Incidentele grave sunt raportate la nivel de localitate sau județ, nu la coordonata exactă selectată."
+
+    return {
+        "level": level,
+        "label": label,
+        "message": message,
+        "has_precise_location": has_precise_location,
+        "has_source_links": has_source_links,
+    }
+
+
+def build_citizen_recommendation(score: float, dominant: Optional[dict[str, Any]]) -> str:
+    if dominant:
+        incident_type = dominant.get("incident_type")
+
+        if incident_type == "homicide":
+            return (
+                "Prudență ridicată. Evitați zonele izolate, deplasările nocturne nejustificate "
+                "și verificați traseul înainte de deplasare."
+            )
+
+        if incident_type == "sexual_violence":
+            return (
+                "Prudență ridicată. Evitați deplasările singur în zone izolate, mai ales seara/noaptea, "
+                "și informați o persoană de încredere despre traseu."
+            )
+
+        if incident_type == "robbery":
+            return (
+                "Prudență. Evitați afișarea bunurilor de valoare, zonele slab iluminate și opririle lungi "
+                "în locuri izolate."
+            )
+
+    if score >= 8:
+        return "Evitați expunerea inutilă în zonă și verificați informațiile oficiale înainte de deplasare."
+    if score >= 5:
+        return "Manifestați prudență, mai ales noaptea sau în zone slab circulate."
+    if score >= 2.5:
+        return "Zona necesită atenție moderată. Verificați contextul local înainte de deplasare."
+
+    return "Nu sunt semnale majore de risc în setul curent de date. Mențineți conduita preventivă obișnuită."
+
+
+def build_ai_assessment(
+    score: float,
+    serious_incidents: list[dict[str, Any]],
+    base: dict[str, Any],
+) -> dict[str, Any]:
+    risk_level = classify_risk_level(score)
+    risk_label = RISK_LEVEL_LABELS.get(risk_level, "Situație analizată")
+    dominant = choose_dominant_incident(serious_incidents)
+    data_quality = build_data_quality(serious_incidents)
+
+    if dominant:
+        display_type = dominant.get("display_type") or incident_type_label(dominant.get("incident_type"))
+        location = dominant.get("location_label") or "zona analizată"
+        distance_text = dominant.get("distance_text") or "localizare estimată"
+
+        if dominant.get("distance_m") is None:
+            summary = (
+                f"Au fost identificate incidente grave raportate în zona administrativă analizată. "
+                f"Incidentul dominant este {display_type.lower()}, raportat în {location}. "
+                f"Localizarea exactă nu este disponibilă, deci evaluarea este interpretată zonal, nu strict pe punctul selectat."
+            )
+        else:
+            summary = (
+                f"Au fost identificate incidente grave în proximitatea zonei analizate. "
+                f"Incidentul dominant este {display_type.lower()}, raportat la {distance_text}, în {location}."
+            )
+
+        why_it_matters = (
+            f"Acest incident influențează scorul deoarece categoria «{display_type}» are severitate ridicată "
+            f"și este relevantă pentru siguranța personală și prevenție."
+        )
+
+        dominant_text = f"{display_type} — {location}"
+    else:
+        summary = (
+            "Nu au fost identificate incidente grave recente în setul curent de date pentru zona analizată. "
+            "Evaluarea rămâne preventivă și depinde de calitatea surselor disponibile."
+        )
+        why_it_matters = "Nu există un incident dominant care să ridice semnificativ nivelul de risc."
+        dominant_text = None
+
+    recommendation = build_citizen_recommendation(score, dominant)
+
+    return {
+        "title": risk_label,
+        "score_text": f"{score:.1f}/10",
+        "summary": summary,
+        "dominant_incident": dominant,
+        "dominant_incident_text": dominant_text,
+        "why_it_matters": why_it_matters,
+        "recommendation": recommendation,
+        "data_quality": data_quality,
+        "community_note": (
+            "Informațiile au rol preventiv și comunitar. Evaluarea nu înlocuiește comunicările autorităților "
+            "și trebuie interpretată în funcție de contextul local."
+        ),
+        "operational_note": (
+            "Prioritizarea IA ia în calcul severitatea, proximitatea, recența și calitatea sursei."
+        ),
+        "screen_blocks": [
+            {
+                "title": "Evaluare IA",
+                "body": summary,
+            },
+            {
+                "title": "Incident dominant",
+                "body": dominant_text or "Nu există incident dominant în zona analizată.",
+            },
+            {
+                "title": "Recomandare",
+                "body": recommendation,
+            },
+            {
+                "title": "Calitatea datelor",
+                "body": data_quality["message"],
+            },
+        ],
+    }
+
+
 def human_message(score: float, nearest_serious: Optional[dict[str, Any]]) -> str:
     if nearest_serious:
         incident_type = nearest_serious.get("incident_type")
         display_type = incident_type_label(incident_type)
-        distance_text = nearest_serious.get("distance_text") or "în proximitatea zonei analizate"
+        distance_text = nearest_serious.get("distance_text") or "localizare estimată"
         location_label = nearest_serious.get("location_label") or "zona analizată"
 
         if incident_type in {"homicide", "sexual_violence"}:
@@ -348,7 +578,7 @@ def fetch_serious_incidents(
                 "published_date": row.get("published_date"),
                 "days_ago": days_ago,
                 "city": row.get("city") or row.get("locality") or row.get("town"),
-                "county": row.get("county") or row.get("judet"),
+                "county": normalize_county_name(row.get("county") or row.get("judet")),
                 "location_label": location_label,
                 "latitude": incident_lat,
                 "longitude": incident_lng,
@@ -362,12 +592,17 @@ def fetch_serious_incidents(
                 "official_badge": "OFICIAL" if is_official else "SURSĂ",
                 "verification_status": row.get("verification_status"),
                 "source_priority": source_priority,
+                "importance_score": 0,
                 "screen_line": f"{incident_type_label(incident_type)} · {distance_text} · {location_label}",
             }
         )
 
+    for item in incidents:
+        item["importance_score"] = round(incident_importance_score(item), 2)
+
     incidents.sort(
         key=lambda item: (
+            -item["importance_score"],
             item["distance_m"] if item["distance_m"] is not None else 999999999,
             item["days_ago"],
             -item["source_priority"],
@@ -386,17 +621,18 @@ def apply_serious_minimum_score(
     if not serious_incidents:
         return round(base_score, 2)
 
-    nearest_distance = serious_incidents[0].get("distance_m")
+    dominant = choose_dominant_incident(serious_incidents)
+    nearest_distance = dominant.get("distance_m") if dominant else None
     score = base_score
 
     if any(item.get("incident_type") == "homicide" for item in serious_incidents):
-        score = max(score, 7.0)
+        score = max(score, 7.2)
 
     if any(item.get("incident_type") == "sexual_violence" for item in serious_incidents):
-        score = max(score, 6.5)
+        score = max(score, 6.8)
 
     if any(item.get("incident_type") == "robbery" for item in serious_incidents):
-        score = max(score, 5.0)
+        score = max(score, 5.3)
 
     if nearest_distance is not None:
         if nearest_distance <= 500:
@@ -448,7 +684,9 @@ def build_risk_response(
 
     risk_level = classify_risk_level(final_score)
     nearest_serious = serious[0] if serious else None
-    message = human_message(final_score, nearest_serious)
+    dominant_incident = choose_dominant_incident(serious)
+    message = human_message(final_score, dominant_incident or nearest_serious)
+    ai_assessment = build_ai_assessment(final_score, serious, base)
 
     return {
         "score": final_score,
@@ -457,7 +695,12 @@ def build_risk_response(
         "risk_label": RISK_LEVEL_LABELS.get(risk_level, "Situație analizată"),
         "risk_badge": risk_badge(final_score),
         "message": message,
-        "screen_message": message,
+        "screen_message": ai_assessment["summary"],
+        "ai_assessment": ai_assessment,
+        "dominant_incident": dominant_incident,
+        "data_quality": ai_assessment["data_quality"],
+        "citizen_recommendation": ai_assessment["recommendation"],
+        "operational_note": ai_assessment["operational_note"],
         "county": base.get("county"),
         "city": base.get("city"),
         "incidents_summary": base.get("incidents_summary", {}),
@@ -469,9 +712,12 @@ def build_risk_response(
         "display": {
             "title": RISK_LEVEL_LABELS.get(risk_level, "Situație analizată"),
             "subtitle": f"Scor risc: {final_score:.1f}/10",
-            "main_message": message,
+            "main_message": ai_assessment["summary"],
             "serious_count": len(serious),
             "nearest_serious": nearest_serious.get("screen_line") if nearest_serious else None,
+            "dominant_incident": dominant_incident.get("screen_line") if dominant_incident else None,
+            "recommendation": ai_assessment["recommendation"],
+            "data_quality": ai_assessment["data_quality"]["label"],
         },
         "analyzed_at": now_iso(),
         "meta": {
@@ -537,12 +783,22 @@ def serious_incidents(
         limit=limit,
     )
 
+    data_quality = build_data_quality(incidents)
+    dominant = choose_dominant_incident(incidents)
+
     return {
         "count": len(incidents),
         "nearest_serious_incident": incidents[0] if incidents else None,
+        "dominant_incident": dominant,
         "incidents": incidents,
-        "screen_title": "Incidente grave în apropiere",
+        "data_quality": data_quality,
+        "screen_title": "Incidente grave analizate de IA",
         "screen_empty_message": "Nu au fost identificate incidente grave recente în zona analizată.",
+        "screen_summary": (
+            f"Incident dominant: {dominant.get('screen_line')}"
+            if dominant
+            else "Nu există incident dominant în zona analizată."
+        ),
         "analyzed_at": now_iso(),
         "meta": {
             "radius_m": radius_m,
