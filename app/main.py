@@ -214,3 +214,73 @@ def heatmap(lat: float, lng: float):
 @app.get("/")
 def home():
     return {"status": "ok"}
+from math import radians, sin, cos, sqrt, atan2
+
+def haversine_meters(lat1, lon1, lat2, lon2):
+    R = 6371000
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return R * c
+
+
+@app.get("/serious-incidents")
+def get_serious_incidents(lat: float, lng: float, radius_m: int = 15000, lookback_days: int = 120):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM incidents
+        WHERE incident_type IN ('homicide', 'sexual_violence', 'robbery')
+    """)
+
+    rows = cursor.fetchall()
+    results = []
+
+    for row in rows:
+        if row["latitude"] is None or row["longitude"] is None:
+            continue
+
+        distance = haversine_meters(lat, lng, row["latitude"], row["longitude"])
+
+        if distance > radius_m:
+            continue
+
+        if row.get("days_ago") is not None and row["days_ago"] > lookback_days:
+            continue
+
+        results.append({
+            "incident_id": row["incident_uid"],
+            "incident_type": row["incident_type"],
+            "incident_label": row["incident_type"].replace("_", " "),
+
+            "city": row["city"],
+            "county": row["county"],
+
+            "latitude": row["latitude"],
+            "longitude": row["longitude"],
+
+            "distance_m": distance,
+            "distance_text": f"{round(distance/1000,1)} km",
+
+            "days_ago": row["days_ago"],
+            "published_date": row["published_date"],
+
+            # 🔴 IMPORTANT
+            "source_name": row.get("source_name"),
+            "source_url": row.get("source_url"),
+            "source_title": row.get("title"),
+
+            "official_confirmation": row.get("verification_status") == "verified",
+            "verification_label": "OFICIAL" if row.get("verification_status") == "verified" else "SURSA"
+        })
+
+    conn.close()
+
+    return {
+        "count": len(results),
+        "items": results
+    }
