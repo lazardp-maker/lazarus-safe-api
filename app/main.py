@@ -27,7 +27,7 @@ from app.risk_engine import (
 from app.schemas import AnalyzeRequest, AnalyzeResponse, ClosestSevereIncident
 
 APP_NAME = "Lazarus Safe API"
-APP_VERSION = os.getenv("APP_VERSION", "3.5.1")
+APP_VERSION = os.getenv("APP_VERSION", "3.5.2")
 APP_ENV = os.getenv("APP_ENV", "development")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 GEOCODER_TIMEOUT_SECONDS = int(os.getenv("GEOCODER_TIMEOUT_SECONDS", "10"))
@@ -362,7 +362,6 @@ def build_human_risk_payload(result: AnalyzeResponse) -> dict[str, Any]:
     debug = result.debug if isinstance(result.debug, dict) else {}
     severe_count = int(debug.get("severe_count", 0) or 0)
     lookback_days = int(debug.get("lookback_days", 60) or 60)
-
     closest_dict = model_to_dict(result.closest_severe_incident) if result.closest_severe_incident else None
 
     friendly = user_friendly_explanation(
@@ -384,6 +383,44 @@ def build_human_risk_payload(result: AnalyzeResponse) -> dict[str, Any]:
         "heatmap_note": friendly.get("important_note"),
         "serious_incidents_count": severe_count,
         "lookback_days": lookback_days,
+    }
+
+
+def build_serious_incident_from_row(row: Any) -> dict[str, Any]:
+    item = dict(row)
+    incident_type = item.get("incident_type")
+
+    labels = {
+        "homicide": "omor / omucidere",
+        "sexual_violence": "violență sexuală",
+        "robbery": "tâlhărie",
+    }
+
+    return {
+        "incident_id": item.get("id"),
+        "incident_type": incident_type,
+        "incident_label": labels.get(incident_type, "incident grav"),
+        "severity": item.get("severity_level"),
+        "title": item.get("title"),
+        "summary": item.get("summary"),
+        "city": item.get("city"),
+        "county": item.get("county"),
+        "latitude": item.get("latitude"),
+        "longitude": item.get("longitude"),
+        "distance_m": None,
+        "distance_text": "locație aproximativă",
+        "days_ago": item.get("days_ago"),
+        "published_date": item.get("published_date"),
+        "source_name": None,
+        "source_type": None,
+        "source_url": None,
+        "source_title": None,
+        "official_confirmation": bool(item.get("is_verified") == 1),
+        "verification_label": (
+            "Confirmat oficial"
+            if item.get("is_verified") == 1
+            else "Incident identificat în sursele colectate"
+        ),
     }
 
 
@@ -638,6 +675,9 @@ def serious_incidents(
 ) -> dict[str, Any]:
     validate_coordinates(lat, lng)
 
+    county, city = reverse_geocode_real(lat, lng)
+    items: list[dict[str, Any]] = []
+
     try:
         items = get_serious_incidents_for_location(
             center_lat=lat,
@@ -647,18 +687,49 @@ def serious_incidents(
             limit=limit,
         )
     except Exception as exc:
-        logger.exception("serious_incidents.failed lat=%s lng=%s error=%s", lat, lng, exc)
-        raise HTTPException(status_code=500, detail=f"Eroare la încărcarea incidentelor grave: {exc}")
+        logger.warning("serious_incidents.geo_search_failed lat=%s lng=%s error=%s", lat, lng, exc)
+
+    if not items and county:
+        county_n = canonicalize_place(county)
+        city_n = canonicalize_place(city) if city else None
+
+        where_parts = [
+            "incident_type IN ('homicide', 'sexual_violence', 'robbery')",
+            "date(COALESCE(event_date, published_date, created_at)) >= date('now', ?)",
+            "county = ?",
+        ]
+        params: list[Any] = [f"-{lookback_days} days", county_n]
+
+        if city_n:
+            where_parts.append("(city = ? OR city IS NULL OR city = '')")
+            params.append(city_n)
+
+        query = f"""
+            SELECT *
+            FROM incidents
+            WHERE {" AND ".join(where_parts)}
+            ORDER BY COALESCE(date(event_date), date(published_date), date(created_at)) DESC, id DESC
+            LIMIT ?
+        """
+        params.append(limit)
+
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+
+        items = [build_serious_incident_from_row(row) for row in rows]
 
     return {
         "count": len(items),
         "radius_m": radius_m,
         "lookback_days": lookback_days,
+        "resolved_county": county,
+        "resolved_city": city,
         "title": "Incidente grave raportate și surse",
         "explanation": (
-            "Această pagină afișează incidentele grave raportate în zona extinsă: "
-            "omucidere, violență sexuală și tâlhărie. Fiecare incident este afișat "
-            "cu sursa principală disponibilă."
+            "Această pagină afișează incidentele grave raportate în zona extinsă. "
+            "Dacă incidentul nu are coordonate exacte, este afișat ca locație aproximativă."
         ),
         "legend": [
             "🚨 Incident grav",
